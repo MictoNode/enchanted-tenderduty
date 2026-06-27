@@ -1,0 +1,22 @@
+# secrets + state (never commit)
+config.yml
+config.yml.asc
+.tenderduty-state.json
+
+# built binaries (README builds -o tenderduty; bare `go build .` -> enchanted-tenderduty)
+tenderduty
+tenderduty-*
+enchanted-tenderduty
+local*
+
+# editor / OS cruft
+.idea
+.DS_Store
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out

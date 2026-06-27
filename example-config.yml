@@ -1,0 +1,174 @@
+---
+# =============================================================================
+# enchanted-tenderduty — full reference config.
+# Every field below corresponds to a real option in td2/types.go. Commented
+# values are optional / have working defaults. Copy to config.yml and edit.
+# Supported alert sinks: discord, telegram, slack, pagerduty, pushover.
+# Supported chain types: cosmos (default) and gnoland.
+# =============================================================================
+
+# --- general -----------------------------------------------------------------
+# controls whether the web dashboard is enabled.
+enable_dashboard: yes
+# TCP port the dashboard listens on.
+listen_port: 8888
+# hide_logs: when yes, the dashboard suppresses the log feed and many node
+# details. Use when posting the dashboard publicly.
+hide_logs: no
+# How long (minutes) to wait before alerting that an RPC node is down.
+node_down_alert_minutes: 3
+# Pagerduty severity for node-down alerts.
+node_down_alert_severity: critical
+# 0 disables; alert when an RPC node is more than N blocks behind the chain head.
+node_lag_alert_blocks: 0
+
+# --- prometheus --------------------------------------------------------------
+prometheus_enabled: yes
+prometheus_listen_port: 28686
+
+# --- alert sinks (global) ----------------------------------------------------
+# Each sink has its own `enabled` flag. A notification is delivered when the
+# global sink is enabled AND the chain-level sink (under chains.<name>.alerts)
+# is enabled. Leave `enabled: no` to disable.
+
+# Pagerduty (https://pagerduty.com). Requires an Events API v1/v2 API key.
+pagerduty:
+  enabled: no
+  api_key: aaaaaaaaaaaabbbbbbbbbbbbbcccccccccccc
+  default_severity: alert
+
+# Discord (webhook). Mentions is an optional list of role/user IDs to ping.
+discord:
+  enabled: no
+  webhook: https://discord.com/api/webhooks/999999999999999999/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+  mentions: []
+
+# Telegram (bot). Get api_key from @BotFather; channel is the target chat ID.
+telegram:
+  enabled: no
+  api_key: "5555555555:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  channel: "-666666666"
+  mentions: []
+
+# Slack (incoming webhook).
+slack:
+  enabled: no
+  webhook: https://hooks.slack.com/services/AAAAAAAAAAAAAAAAAAAAAAA/bbbbbbbbbbbbbbbbbbbbbbbb
+  mentions: []
+
+# Pushover (https://pushover.net) — mobile push notifications.
+# priority: -2..2. 2 = emergency, breaks through Do Not Disturb and repeats
+# until acknowledged (requires retry/expire). resolved/recovery alerts are
+# clamped to priority <= 0 so they never repeat.
+pushover:
+  enabled: no
+  token: "APP_TOKEN_HERE"          # application API token from pushover.net
+  user_key: "USER_KEY_HERE"        # your user/group key
+  priority: 2                      # 2=emergency (needs retry/expire); 0=normal; -2=lowest
+  sound: "persistent"             # optional sound name
+  retry: 30                       # seconds between retries (emergency only, min 30)
+  expire: 3600                    # seconds until retry expires (emergency only, max 10800)
+
+# Healthcheck / dead-man's-switch ping.
+healthcheck:
+  enabled: no
+  ping_url: https://hc-ping.com/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  ping_rate: 60
+
+# --- chains ------------------------------------------------------------------
+chains:
+  # ----- Cosmos / Evmos example (default provider) -----
+  # Omitting `type:` defaults to cosmos: websocket block subscription +
+  # cosmos-sdk staking/slashing queries.
+  "Osmosis":
+    chain_id: osmosis-1
+    # network: mainnet or testnet — drives the dashboard's tabs. Optional; empty
+    # = appears only in the "all" tab. Free-form otherwise (the chain name is too).
+    network: mainnet
+    # Validator OPERATOR (valoper) address. tenderduty derives the consensus
+    # (valcons) key automatically via abci queries.
+    valoper_address: osmovaloper1xxxxxxx...
+    # Fall back to public RPC endpoints if all configured nodes fail (not recommended).
+    public_fallback: no
+
+    alerts:
+      stalled_enabled: yes        # alert if no new blocks arrive
+      stalled_minutes: 10         # minutes without a block before alerting
+
+      consecutive_enabled: yes    # alert on N consecutive missed blocks
+      consecutive_missed: 5
+      consecutive_priority: critical   # pagerduty severity tag
+
+      percentage_enabled: no      # alert on % of slashing window missed
+      percentage_missed: 10
+      percentage_priority: warning
+
+      alert_if_inactive: yes      # alert if validator leaves the active set
+      alert_if_no_servers: yes    # alert if no RPC nodes respond
+
+      # Per-chain sink overrides. Empty api_key/webhook/channel fall back to the
+      # global values. `enabled` must be yes both here and globally.
+      pagerduty:
+        enabled: yes
+        api_key: ""               # blank = use global api_key
+        default_severity: ""
+      discord:
+        enabled: yes
+        webhook: ""               # blank = use global webhook
+        mentions: []
+      telegram:
+        enabled: yes
+        api_key: ""               # blank = use global api_key
+        channel: ""               # blank = use global channel
+        mentions: []
+      slack:
+        enabled: yes
+        webhook: ""               # blank = use global webhook
+        mentions: []
+      pushover:
+        enabled: yes
+        token: ""                 # blank = use global token
+        user_key: ""              # blank = use global user_key
+        priority: 2               # override per chain (e.g. emergency for mainnet)
+        sound: ""                 # blank = use global sound
+        retry: 30
+        expire: 3600
+
+    nodes:
+      - url: tcp://localhost:26657
+        alert_if_down: yes
+      - url: https://some-other-node:443
+        alert_if_down: no
+
+  # ----- Gnoland example -----
+  # `type: gnoland` selects the gnoland provider: HTTP-polling /block every 5s
+  # (TM2 public nodes have no websocket) + the gno valopers realm.
+  # valoper_address is the OPERATOR address shown on gnoweb
+  # (gno.land/r/gnops/valopers:<operator>). The signing/consensus address used
+  # by /validators and /block is auto-derived from the realm — do NOT put the
+  # signing address here.
+  # "Gno-Testnet":
+  #   chain_id: test11
+  #   network: testnet
+  #   type: gnoland
+  #   valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # operator addr (gnoweb)
+  #   gno_valopers_realm: "gno.land/r/gnops/valopers"             # default; override only if needed
+  #   alerts:
+  #     stalled_enabled: yes
+  #     stalled_minutes: 5
+  #     consecutive_enabled: yes
+  #     consecutive_missed: 10
+  #     consecutive_priority: critical
+  #     percentage_enabled: no
+  #     percentage_missed: 10
+  #     percentage_priority: warning
+  #     alert_if_inactive: yes
+  #     alert_if_no_servers: yes
+  #     pushover:
+  #       enabled: yes
+  #       priority: 2
+  #       retry: 30
+  #       expire: 3600
+  #   nodes:
+  #     - url: https://rpc.gno.example:443
+  #       alert_if_down: yes

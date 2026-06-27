@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Node Monitor - Validator Monitoring">
+  <title>Node Monitor</title>
+
+  <!-- PWA Meta Tags -->
+  <meta name="theme-color" content="#3b82f6">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Node Monitor">
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="css/styles.css?v=10" />
+  <link rel="icon" href="icon-192.png">
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+
+<body onload="initApp()">
+  <div class="td-container">
+
+    <!-- Tab Navigation -->
+    <nav class="td-tabs" id="tabNav">
+      <button class="td-tab active" data-tab="all" onclick="switchTab('all')">
+        <i data-lucide="layers"></i> All Chains
+        <span class="td-tab-badge" id="count-all">0</span>
+      </button>
+      <button class="td-tab" data-tab="mainnet" onclick="switchTab('mainnet')">
+        <i data-lucide="globe"></i> Mainnet
+        <span class="td-tab-badge" id="count-mainnet">0</span>
+      </button>
+      <button class="td-tab" data-tab="testnet" onclick="switchTab('testnet')">
+        <i data-lucide="flask-conical"></i> Testnet
+        <span class="td-tab-badge" id="count-testnet">0</span>
+      </button>
+    </nav>
+
+    <!-- Block Grid -->
+    <section class="td-grid-container glass-card" id="gridSection">
+      <div class="td-grid-scroll">
+        <canvas id="canvas" height="20" width="4735"></canvas>
+      </div>
+      <div class="td-legend" id="legendContainer">
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: linear-gradient(135deg, #22c55e 0%, #4ade80 100%);"></div>
+          <span>Proposer</span>
+        </div>
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: rgba(59, 130, 246, 0.3);"></div>
+          <span>Signed</span>
+        </div>
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: #3b82f6;"></div>
+          <span>Miss/Precommit</span>
+        </div>
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: #22d3ee;"></div>
+          <span>Miss/Prevote</span>
+        </div>
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: #f97316;"></div>
+          <span>Missed</span>
+        </div>
+        <div class="td-legend-item">
+          <div class="td-legend-color" style="background: rgba(100, 116, 139, 0.3);"></div>
+          <span>No Data</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Chain Table -->
+    <section class="td-table-container">
+      <table class="td-table">
+        <thead>
+          <tr>
+            <th style="width: 40px;"></th>
+            <th>Chain</th>
+            <th style="text-align: center;">Status</th>
+            <th>Height</th>
+            <th>Uptime</th>
+            <th style="text-align: center;">RPC Nodes</th>
+          </tr>
+        </thead>
+        <tbody id="statusTable"></tbody>
+      </table>
+    </section>
+
+    <!-- Footer -->
+    <footer class="td-footer">
+      <a href="https://github.com/MictoNode/enchanted-tenderduty" target="_blank">
+        Enchanted Tenderduty
+      </a>
+      &nbsp;•&nbsp;
+      Powered by MictoNode
+    </footer>
+
+  </div>
+
+
+
+  <!-- Scripts -->
+  <script src="./js/lodash.min.js"></script>
+  <script src="grid.js?v=10"></script>
+  <script src="status.js?v=10"></script>
+  <script>
+    // Initialize Lucide icons
+    lucide.createIcons();
+
+    // Register Service Worker for PWA
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js')
+          .then((registration) => {
+            console.log('[PWA] Service Worker registered:', registration.scope);
+          })
+          .catch((error) => {
+            console.log('[PWA] Service Worker registration failed:', error);
+          });
+      });
+    }
+  </script>
+</body>
+
+</html>
