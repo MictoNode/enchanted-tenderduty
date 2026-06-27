@@ -170,7 +170,6 @@ func saveOnExit(stateFile string, saved chan interface{}) {
 		for k, v := range td.Chains {
 			if v.Type == "gnoland" && v.valInfo != nil {
 				gnoCounters[k] = &gnoSavedStats{
-					Missed: v.valInfo.Missed, Window: v.valInfo.Window,
 					TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
 					TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
 				}

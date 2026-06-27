@@ -278,7 +278,7 @@ per-chain overrides, healthcheck, etc.).
 
 - gno.land has **two addresses per validator**: an operator address (the valopers realm key, shown on gnoweb) and a signing/consensus address (used by `/validators` and `/block`). Put the **operator** address in `valoper_address`; the signing address is resolved automatically from the realm.
 - Public gno.land nodes generally **don't support websocket subscriptions**, so the gno provider **HTTP-polls** `/block` every 5s and reconstructs signing status from `last_commit.precommits`.
-- gno has **no on-chain slashing module**, so `missed`/`window` are tracked locally (and persisted across restart). `consecutive_missed` is the **primary** gno alert; `percentage_missed` is best-effort.
+- gno has **no on-chain slashing module**, so there is no slashing window to query. The optional `gno_signed_blocks_window` (default 10000) defines a **LOCAL sliding signing-health window** (last N blocks) that drives the dashboard uptime % and the `percentage_missed` alert — it is a health metric, **not** a slashing window. `consecutive_missed` remains the **primary** gno alert.
 - A validator that is resolved but **not in the active set** is not expected to sign, so it neither accrues missed counters nor fires false consecutive alerts; the dashboard shows its blocks as "No Data".
 - Jailed is detected when the validator leaves the active set.
 

@@ -153,6 +153,10 @@ chains:
   #   type: gnoland
   #   valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # operator addr (gnoweb)
   #   gno_valopers_realm: "gno.land/r/gnops/valopers"             # default; override only if needed
+  #   gno_signed_blocks_window: 10000                              # gno has NO on-chain slashing window;
+  #                                                                # this LOCAL sliding window (last N
+  #                                                                # blocks) drives uptime % + percentage.
+  #                                                                # Default 10000.
   #   alerts:
   #     stalled_enabled: yes
   #     stalled_minutes: 5

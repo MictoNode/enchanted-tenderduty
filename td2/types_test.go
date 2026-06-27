@@ -34,7 +34,7 @@ func TestChainConfigTypeRejectsUnknown(t *testing.T) {
 func TestSavedStateGnoCountersRoundTrip(t *testing.T) {
 	s := savedState{
 		GnoCounters: map[string]*gnoSavedStats{
-			"gno": {Missed: 7, Window: 100, TotalSigns: 90, ConsecutiveMiss: 3},
+			"gno": {TotalSigns: 90, TotalProps: 5, TotalMiss: 7, ConsecutiveMiss: 3},
 		},
 	}
 	b, err := json.Marshal(&s)
@@ -45,7 +45,8 @@ func TestSavedStateGnoCountersRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
 	}
-	if back.GnoCounters["gno"] == nil || back.GnoCounters["gno"].Missed != 7 {
+	g := back.GnoCounters["gno"]
+	if g == nil || g.TotalSigns != 90 || g.TotalMiss != 7 || g.ConsecutiveMiss != 3 {
 		t.Fatalf("round-trip lost gno counters: %+v", back.GnoCounters)
 	}
 }

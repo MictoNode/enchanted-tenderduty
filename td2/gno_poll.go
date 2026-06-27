@@ -65,6 +65,11 @@ func (cc *ChainConfig) PollRun() {
 	}
 
 	l(fmt.Sprintf("⚙️ %-12s polling for new blocks from %s", cc.ChainId, cc.gnoRpcEndpoint))
+	windowSize := cc.GnoSignedBlocksWindow
+	if windowSize <= 0 {
+		windowSize = 10000
+	}
+	cc.gnoWin = newGnoWindow(windowSize)
 	var lastHeight int64
 	noBlockSince := time.Now()
 	tick := time.NewTicker(5 * time.Second)
@@ -127,11 +132,12 @@ func (cc *ChainConfig) PollRun() {
 			// so counting its misses would produce false consecutive/percentage
 			// alerts (e.g. a node that has not started validating yet).
 			if cc.valInfo.Bonded {
+				isMiss := false
 				switch signState {
 				case Statusmissed:
 					cc.statTotalMiss += 1
 					cc.statConsecutiveMiss += 1
-					cc.valInfo.Missed += 1
+					isMiss = true
 				case StatusSigned:
 					cc.statTotalSigns += 1
 					cc.statConsecutiveMiss = 0
@@ -140,7 +146,12 @@ func (cc *ChainConfig) PollRun() {
 					cc.statTotalSigns += 1
 					cc.statConsecutiveMiss = 0
 				}
-				cc.valInfo.Window += 1
+				// Sliding signing-health window (NOT a slashing window; gno has none).
+				// valInfo.Missed/Window are now bounded + sliding (cosmos-like), so the
+				// dashboard uptime % and percentage_missed alert stay meaningful.
+				cc.gnoWin.Push(isMiss)
+				cc.valInfo.Missed = int64(cc.gnoWin.Missed())
+				cc.valInfo.Window = int64(cc.gnoWin.Window())
 			}
 			healthyNodes := 0
 			for i := range cc.Nodes {

@@ -86,11 +86,10 @@ type savedState struct {
 	GnoCounters map[string]*gnoSavedStats       `json:"gno_counters,omitempty"`
 }
 
-// gnoSavedStats persists gnoland local counters so the percentage-missed alert
-// survives restart (gno has no on-chain slashing window to re-read).
+// gnoSavedStats persists gnoland cumulative counters (prometheus gauges +
+// consecutive-miss streak) across restart. valInfo.Missed/Window are NOT
+// persisted — they come from the ephemeral gnoWin sliding ring (warm-up).
 type gnoSavedStats struct {
-	Missed          int64   `json:"missed"`
-	Window          int64   `json:"window"`
 	TotalSigns      float64 `json:"total_signs"`
 	TotalProps      float64 `json:"total_props"`
 	TotalMiss       float64 `json:"total_miss"`
@@ -111,7 +110,8 @@ type ChainConfig struct {
 	lastBlockTime  time.Time
 	lastBlockAlarm bool
 	lastBlockNum   int64
-	gnoRpcEndpoint string // gno: the working RPC base URL chosen by gnoNewRpc
+	gnoRpcEndpoint string     // gno: the working RPC base URL chosen by gnoNewRpc
+	gnoWin         *gnoWindow // gno: sliding signing-health window (gno_signed_blocks_window)
 	activeAlerts   int
 
 	statTotalSigns      float64
@@ -151,6 +151,12 @@ type ChainConfig struct {
 	// GnoValopersRealm is the gno realm path used to resolve validator monikers via vm/qeval.
 	// Only used when Type == "gnoland". Defaults to "gno.land/r/gnops/valopers".
 	GnoValopersRealm string `yaml:"gno_valopers_realm"`
+
+	// GnoSignedBlocksWindow is the size of the LOCAL sliding signing-health
+	// window for gnoland (dashboard uptime % + percentage_missed denominator).
+	// gno.land has NO on-chain slashing module, so this is NOT a slashing window
+	// — it is a local health metric. Only used when Type == "gnoland". Default 10000.
+	GnoSignedBlocksWindow int `yaml:"gno_signed_blocks_window"`
 }
 
 // mkUpdate returns the info needed by prometheus for a gauge.
@@ -606,13 +612,13 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 			if c.Chains[k].valInfo == nil {
 				c.Chains[k].valInfo = &ValInfo{}
 			}
-			c.Chains[k].valInfo.Missed = v.Missed
-			c.Chains[k].valInfo.Window = v.Window
 			c.Chains[k].statTotalSigns = v.TotalSigns
 			c.Chains[k].statTotalProps = v.TotalProps
 			c.Chains[k].statTotalMiss = v.TotalMiss
 			c.Chains[k].statConsecutiveMiss = v.ConsecutiveMiss
-			l(fmt.Sprintf("📂 restored gno counters for %s (missed=%d window=%d)", k, v.Missed, v.Window))
+			// valInfo.Missed/Window are NOT restored: they come from the ephemeral
+			// gnoWin sliding ring (warm-up after restart), not a persisted counter.
+			l(fmt.Sprintf("📂 restored gno counters for %s", k))
 		}
 	}
 
