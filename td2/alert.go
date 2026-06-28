@@ -92,6 +92,17 @@ func (a *alarmCache) getCount(chain string) int {
 	return len(a.AllAlarms[chain])
 }
 
+// hasMessage reports whether a specific alarm message is currently active for a
+// chain (present in the cache). This is the persistent source of truth for whether
+// a stalled alarm needs resolving — unlike the runtime lastBlockAlarm flag, which
+// the poller resets on every block and so cannot be relied on to survive a stall
+// followed by recovery.
+func (a *alarmCache) hasMessage(chain, message string) bool {
+	a.notifyMux.RLock()
+	defer a.notifyMux.RUnlock()
+	return a.AllAlarms[chain] != nil && !a.AllAlarms[chain][message].IsZero()
+}
+
 func (a *alarmCache) clearAll(chain string) {
 	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
 		return
@@ -460,6 +471,38 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 	alarms.AllAlarms[chainName][message] = time.Now()
 }
 
+// stalledTransition decides the stalled-chain alarm transition given the last
+// block time and current alarm state. It returns "fire" when the chain has been
+// idle past the threshold and no alarm is active, "resolve" when an active alarm
+// should clear (blocks are flowing again within the threshold, or no block has
+// ever been seen), and "" otherwise. Shared by the cosmos and gnoland providers
+// via watch().
+//
+// The recover ("resolve") path is what clears a stalled alarm once blocks resume:
+// without it the alarm lingered in the cache (and survived restart via saved
+// state), keeping the dashboard's alert indicator blinking after a transient stall.
+func stalledTransition(stalledAlerts bool, lastBlockAlarm bool, lastBlockTime time.Time, stalledMin int, now time.Time) string {
+	if !stalledAlerts {
+		return ""
+	}
+	if lastBlockTime.IsZero() {
+		// never seen a block, so it cannot be stalled; clear a lingering alarm only
+		if lastBlockAlarm {
+			return "resolve"
+		}
+		return ""
+	}
+	stalled := lastBlockTime.Before(now.Add(-time.Duration(stalledMin) * time.Minute))
+	switch {
+	case stalled && !lastBlockAlarm:
+		return "fire"
+	case !stalled && lastBlockAlarm:
+		return "resolve"
+	default:
+		return ""
+	}
+}
+
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
 // Node-lag detection (node behind head) runs in monitorHealth via nodeLagCheck().
@@ -532,28 +575,23 @@ func (cc *ChainConfig) watch() {
 			noNodesSec = 0
 		}
 
-		// stalled chain detection
-		if cc.Alerts.StalledAlerts && !cc.lastBlockAlarm && !cc.lastBlockTime.IsZero() &&
-			cc.lastBlockTime.Before(time.Now().Add(time.Duration(-cc.Alerts.Stalled)*time.Minute)) {
-
-			// chain is stalled send an alert!
+		// stalled chain detection. The transition is driven by whether a stalled
+		// alarm is actually present in the cache (persistent source of truth), not
+		// the runtime lastBlockAlarm flag — the poller resets that on every block,
+		// so by the time watch() runs after a recovery it is already false and a
+		// resolve would never fire, leaving the alarm (and the dashboard indicator)
+		// stuck. Using hasMessage makes both the live recover and a restart-after-
+		// recover clear the lingering alarm.
+		stalledMsg := fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled)
+		switch stalledTransition(cc.Alerts.StalledAlerts, alarms.hasMessage(cc.name, stalledMsg), cc.lastBlockTime, cc.Alerts.Stalled, time.Now()) {
+		case "fire":
+			// chain is stalled, send an alert
 			cc.lastBlockAlarm = true
-			td.alert(
-				cc.name,
-				fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
-				"critical",
-				false,
-				&cc.valInfo.Valcons,
-			)
-		} else if cc.Alerts.StalledAlerts && cc.lastBlockAlarm && cc.lastBlockTime.IsZero() {
+			td.alert(cc.name, stalledMsg, "critical", false, &cc.valInfo.Valcons)
+		case "resolve":
+			// blocks are flowing again (or we never saw one); clear the alarm
 			cc.lastBlockAlarm = false
-			td.alert(
-				cc.name,
-				fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
-				"info",
-				true,
-				&cc.valInfo.Valcons,
-			)
+			td.alert(cc.name, stalledMsg, "info", true, &cc.valInfo.Valcons)
 			alarms.clearNoBlocks(cc.name)
 		}
 

@@ -64,7 +64,7 @@ func (cc *ChainConfig) PollRun() {
 		return
 	}
 
-	l(fmt.Sprintf("⚙️ %-12s polling for new blocks from %s", cc.ChainId, cc.gnoRpcEndpoint))
+	l(fmt.Sprintf("⚙️ %-12s polling %d node(s) for new blocks", cc.ChainId, len(cc.Nodes)))
 	windowSize := cc.GnoSignedBlocksWindow
 	if windowSize <= 0 {
 		windowSize = 10000
@@ -78,35 +78,57 @@ func (cc *ChainConfig) PollRun() {
 	for {
 		select {
 		case <-tick.C:
-			url := strings.TrimRight(cc.gnoRpcEndpoint, "/") + "/block"
-			client := &http.Client{Timeout: 10 * time.Second}
-			resp, err := client.Get(url)
-			if err != nil {
+			// Poll every configured node each tick and advance to the highest height
+			// seen. A single stale/lagging endpoint can no longer freeze monitoring —
+			// a healthy node carries the chain past it. Previously PollRun was pinned
+			// to one endpoint (cc.gnoRpcEndpoint) and stalled whenever it kept serving
+			// a stale /block, producing false "stalled chain" alerts while the network
+			// was actually healthy.
+			var bestBR *pollBlockResult
+			var bestHeight int64 = -1
+			for i := range cc.Nodes {
+				node := cc.Nodes[i]
+				if node.down {
+					continue
+				}
+				url := strings.TrimRight(node.Url, "/") + "/block"
+				client := &http.Client{Timeout: 10 * time.Second}
+				resp, err := client.Get(url)
+				if err != nil {
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				var br pollBlockResult
+				if err = json.Unmarshal(body, &br); err != nil {
+					continue
+				}
+				var h int64
+				fmt.Sscanf(br.Result.Block.Header.Height, "%d", &h)
+				if h > bestHeight {
+					bestHeight = h
+					bestBR = &br
+				}
+			}
+			if bestBR == nil || bestHeight <= lastHeight {
+				// No node produced an advance this tick. If this persists across every
+				// node for 2 minutes, force a reconnect so gnoNewRpc re-evaluates the
+				// endpoints (mirrors the cosmos websocket's 1-minute idle exit). The
+				// stalled-chain alarm itself is raised by watch() from lastBlockTime.
 				if time.Since(noBlockSince) > 2*time.Minute {
 					l("🛑", cc.ChainId, "no blocks for 2 min, exiting")
 					return
 				}
 				continue
 			}
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			var br pollBlockResult
-			if err = json.Unmarshal(body, &br); err != nil {
-				continue
-			}
-			var height int64
-			fmt.Sscanf(br.Result.Block.Header.Height, "%d", &height)
-			if height <= lastHeight {
-				continue
-			}
 			noBlockSince = time.Now()
-			lastHeight = height
+			lastHeight = bestHeight
 
-			signState := gnoSignState(cc.valInfo.Valcons, &br)
-			if height%20 == 0 {
-				l(fmt.Sprintf("🧊 %-12s block %d", cc.ChainId, height))
+			signState := gnoSignState(cc.valInfo.Valcons, bestBR)
+			if bestHeight%20 == 0 {
+				l(fmt.Sprintf("🧊 %-12s block %d", cc.ChainId, bestHeight))
 			}
-			cc.lastBlockNum = height
+			cc.lastBlockNum = bestHeight
 			if td.Prom {
 				td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
 			}
@@ -122,7 +144,7 @@ func (cc *ChainConfig) PollRun() {
 			}
 			cc.blocksResults = append([]int{gridBlock}, cc.blocksResults[:len(cc.blocksResults)-1]...)
 			if signState < 3 && cc.valInfo.Bonded {
-				warn := fmt.Sprintf("❌ %s missed block %d on %s", cc.valInfo.Moniker, height, cc.ChainId)
+				warn := fmt.Sprintf("❌ %s missed block %d on %s", cc.valInfo.Moniker, bestHeight, cc.ChainId)
 				info += warn + "\n"
 				cc.lastError = time.Now().UTC().String() + " " + info
 				l(warn)
@@ -165,7 +187,7 @@ func (cc *ChainConfig) PollRun() {
 					MsgType: "status", Name: cc.name, ChainId: cc.ChainId, Network: cc.Network, Moniker: cc.valInfo.Moniker,
 					Bonded: cc.valInfo.Bonded, Jailed: cc.valInfo.Jailed, Tombstoned: cc.valInfo.Tombstoned,
 					Missed: cc.valInfo.Missed, Window: cc.valInfo.Window, Nodes: len(cc.Nodes),
-					HealthyNodes: healthyNodes, ActiveAlerts: cc.activeAlerts, Height: height,
+					HealthyNodes: healthyNodes, ActiveAlerts: cc.activeAlerts, Height: bestHeight,
 					LastError: info, Blocks: cc.blocksResults,
 				}
 			}
