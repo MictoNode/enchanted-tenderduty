@@ -71,27 +71,64 @@ func TestNotifyPushoverPostsEmergency(t *testing.T) {
 	}
 }
 
-func TestNotifyPushoverResolvedClampsPriority(t *testing.T) {
+func TestNotifyPushoverSkipsResolveAndNonCritical(t *testing.T) {
 	resetAlarms()
-	var got url.Values
+	hits := 0
+	var last url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
 		b, _ := io.ReadAll(r.Body)
-		got, _ = url.ParseQuery(string(b))
+		last, _ = url.ParseQuery(string(b))
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 	pushoverEndpoint = srv.URL + "/messages.json"
-	// seed the alert (non-resolved) so the resolve is actually delivered
-	seed := &alertMsg{po: true, chain: "c", message: "ok", poToken: "t", poUser: "u", poPriority: 2, poRetry: 30, poExpire: 3600}
-	if err := notifyPushover(seed); err != nil {
-		t.Fatalf("seed notifyPushover: %v", err)
+
+	poCfg := func(sev string, resolved bool) *alertMsg {
+		return &alertMsg{
+			po: true, chain: "c", message: "m", severity: sev, resolved: resolved,
+			poToken: "t", poUser: "u", poPriority: 2, poRetry: 30, poExpire: 3600,
+		}
 	}
-	// now resolve — priority must clamp to 0
-	msg := &alertMsg{po: true, resolved: true, chain: "c", message: "ok", poToken: "t", poUser: "u", poPriority: 2, poRetry: 30, poExpire: 3600}
-	if err := notifyPushover(msg); err != nil {
+
+	// non-critical fire -> not delivered
+	if err := notifyPushover(poCfg("warning", false)); err != nil {
+		t.Fatalf("warning notifyPushover: %v", err)
+	}
+	if hits != 0 {
+		t.Fatalf("non-critical must not be delivered to pushover, hits=%d", hits)
+	}
+
+	// resolve -> not delivered, even of a critical alarm
+	if err := notifyPushover(poCfg("critical", true)); err != nil {
 		t.Fatalf("resolve notifyPushover: %v", err)
 	}
-	if got.Get("priority") != "0" {
-		t.Fatalf("resolved must clamp priority to 0, got %q", got.Get("priority"))
+	if hits != 0 {
+		t.Fatalf("resolve must not be delivered to pushover, hits=%d", hits)
+	}
+
+	// critical fire -> delivered
+	if err := notifyPushover(poCfg("critical", false)); err != nil {
+		t.Fatalf("critical fire notifyPushover: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("critical fire must be delivered, hits=%d", hits)
+	}
+	if last.Get("priority") != "2" {
+		t.Fatalf("critical fire keeps emergency priority, got %q", last.Get("priority"))
+	}
+
+	// resolve (suppressed) must still clear dedup so a re-fire is delivered again
+	if err := notifyPushover(poCfg("critical", true)); err != nil {
+		t.Fatalf("second resolve notifyPushover: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("resolve still not delivered, hits=%d", hits)
+	}
+	if err := notifyPushover(poCfg("critical", false)); err != nil {
+		t.Fatalf("re-fire notifyPushover: %v", err)
+	}
+	if hits != 2 {
+		t.Fatalf("re-fire after suppressed resolve must be delivered (dedup cleared), hits=%d", hits)
 	}
 }

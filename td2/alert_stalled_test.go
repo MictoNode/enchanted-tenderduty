@@ -46,6 +46,44 @@ func TestStalledTransition(t *testing.T) {
 	}
 }
 
+// TestInactiveTransition covers the validator-inactive (jailed/tombstoned) alarm
+// state machine in watch(). It mirrors stalledTransition: the resolve decision is
+// driven by whether the alarm is actually present in the cache (alarmActive), not
+// by the bonded-state diff alone. Without this gate, while a bonded-state diff
+// persists between gnoMonitorHealth refreshes (up to a minute), watch() re-fires
+// the resolve every 2s tick and shouldNotify spams "no corresponding alert" for
+// every sink — exactly the prod log noise seen when a gno validator was
+// transiently misread as inactive.
+func TestInactiveTransition(t *testing.T) {
+	cases := []struct {
+		name        string
+		alerts      bool
+		lastBonded  bool
+		curBonded   bool
+		alarmActive bool
+		want        string
+	}{
+		{"fire when newly inactive and not already alarmed", true, true, false, false, "fire"},
+		{"no-op when inactive but already alarmed", true, true, false, true, ""},
+		{"resolve when back to active and alarm present", true, false, true, true, "resolve"},
+		{"no-op resolve when active but no prior alarm (the spam bug)", true, false, true, false, ""},
+		{"no-op when bonded unchanged (both bonded)", true, true, true, false, ""},
+		{"no-op when never bonded", true, false, false, false, ""},
+		{"disabled: no fire", false, true, false, false, ""},
+		{"disabled: no resolve", false, false, true, true, ""},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := inactiveTransition(c.alerts, c.lastBonded, c.curBonded, c.alarmActive)
+			if got != c.want {
+				t.Fatalf("inactiveTransition(%v,%v,%v,%v) = %q, want %q",
+					c.alerts, c.lastBonded, c.curBonded, c.alarmActive, got, c.want)
+			}
+		})
+	}
+}
+
 // TestAlarmCacheHasMessage verifies the cache lookup the stalled resolver relies
 // on to decide whether a stalled alarm is still active (and thus needs clearing).
 func TestAlarmCacheHasMessage(t *testing.T) {

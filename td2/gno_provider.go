@@ -242,6 +242,31 @@ func (cc *ChainConfig) gnoRPCUrl() string {
 	return ""
 }
 
+// gnoCheckBonded reports whether the signing (consensus) address is in the active
+// validator set, querying every non-down node. It mirrors the poll-all philosophy
+// of PollRun: a single stale/lagging endpoint — or a transient /validators error
+// on the one sticky endpoint the old code used — must not flip a bonded validator
+// to inactive (which would raise a false "jailed" alarm). The validator is
+// considered bonded if ANY healthy node lists it. Returns (bonded, ok); ok is
+// false only when every endpoint failed, an indeterminate case where the caller
+// keeps the prior bonded state instead of treating the validator as inactive.
+func (cc *ChainConfig) gnoCheckBonded(signingAddr string) (bonded, ok bool) {
+	for _, n := range cc.Nodes {
+		if n.down {
+			continue
+		}
+		b, err := GnoIsValidatorActive(n.Url, signingAddr)
+		if err != nil {
+			continue
+		}
+		ok = true
+		if b {
+			return true, true
+		}
+	}
+	return false, ok
+}
+
 // GnoGetValInfo populates valInfo for a gnoland chain via HTTP RPC. No cosmos-sdk dependency.
 //
 // Config valoper_address holds the OPERATOR address (the realm key shown on
@@ -282,16 +307,23 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 	}
 
 	// Active-set check uses the signing (consensus) address — that is what
-	// /validators lists. Skipped when the signing address is unknown.
+	// /validators lists. Polls every non-down node and treats the validator as
+	// bonded if ANY healthy node lists it (poll-all); a transient error or lag on
+	// one endpoint must not flip a bonded validator to inactive (false "jailed").
+	// When every endpoint fails (indeterminate) the prior bonded state is kept.
+	// Skipped when the signing address is unknown.
 	bonded := false
 	if signingAddr != "" {
-		b, err := GnoIsValidatorActive(rpcURL, signingAddr)
-		if err != nil {
-			if first {
-				l(fmt.Sprintf("⚠️ could not check active set for %s: %s", signingAddr, err))
-			}
-		} else {
+		b, ok := cc.gnoCheckBonded(signingAddr)
+		if ok {
 			bonded = b
+		} else {
+			// indeterminate: keep the last known bonded state so a transient
+			// all-endpoints failure can't raise a false "jailed" alarm
+			bonded = cc.valInfo.Bonded
+			if first {
+				l(fmt.Sprintf("⚠️ could not check active set for %s: all RPC endpoints failed", signingAddr))
+			}
 		}
 	}
 	// jailed detection: validator left the active set since last refresh

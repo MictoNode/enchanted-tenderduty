@@ -212,3 +212,65 @@ func TestGnoGetValInfoBondedAndJailed(t *testing.T) {
 		t.Fatal("should not be jailed on first refresh")
 	}
 }
+
+// TestGnoCheckBondedPollsAllNodes proves the active-set check polls every
+// non-down node and treats the validator as bonded when ANY healthy node reports
+// it active. This is the poll-all philosophy: a single stale/lagging endpoint —
+// or a transient /validators error on the one sticky endpoint the old code used —
+// must not flip a bonded validator to "jailed" (the false-alarm root cause).
+func TestGnoCheckBondedPollsAllNodes(t *testing.T) {
+	signing := "1111111123456789abcdef0123456789abcdef01"
+	withoutAddr := `{"jsonrpc":"2.0","result":{"validators":[{"address":"0000000000000000000000000000000000000000"}]}}`
+	withAddr := `{"jsonrpc":"2.0","result":{"validators":[{"address":"` + signing + `"}]}}`
+
+	t.Run("one node errors, other confirms bonded -> bonded", func(t *testing.T) {
+		errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer errSrv.Close()
+		okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(withAddr))
+		}))
+		defer okSrv.Close()
+
+		cc := &ChainConfig{Nodes: []*NodeConfig{{Url: errSrv.URL}, {Url: okSrv.URL}}}
+		bonded, ok := cc.gnoCheckBonded(signing)
+		if !ok {
+			t.Fatal("expected ok=true: at least one node answered")
+		}
+		if !bonded {
+			t.Fatal("expected bonded: healthy node has the signing addr")
+		}
+	})
+
+	t.Run("all healthy nodes report absent -> not bonded", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(withoutAddr))
+		}))
+		defer srv.Close()
+		cc := &ChainConfig{Nodes: []*NodeConfig{{Url: srv.URL}}}
+		bonded, ok := cc.gnoCheckBonded(signing)
+		if !ok {
+			t.Fatal("expected ok=true: node answered")
+		}
+		if bonded {
+			t.Fatal("expected not bonded: signing addr absent from set")
+		}
+	})
+
+	t.Run("all nodes down or failing -> ok=false (indeterminate)", func(t *testing.T) {
+		errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer errSrv.Close()
+		// one down flag, one erroring
+		cc := &ChainConfig{Nodes: []*NodeConfig{{Url: errSrv.URL, down: true}, {Url: errSrv.URL}}}
+		bonded, ok := cc.gnoCheckBonded(signing)
+		if ok {
+			t.Fatal("expected ok=false: every endpoint failed or was down")
+		}
+		if bonded {
+			t.Fatal("expected bonded=false when indeterminate")
+		}
+	})
+}

@@ -341,22 +341,30 @@ func notifyPushover(msg *alertMsg) (err error) {
 	if !msg.po {
 		return nil
 	}
+	// Pushover is reserved for genuinely important (critical) notifications only:
+	// it does not deliver resolves or non-critical alerts (Telegram/Discord/etc.
+	// still receive the full stream). We still clear the dedup entry on resolve so
+	// a later genuine re-fire of the same critical alarm is delivered rather than
+	// suppressed — without this, a suppressed resolve would leave the sent-entry
+	// in place and shouldNotify would drop the next fire as a duplicate.
+	if msg.resolved {
+		alarms.notifyMux.Lock()
+		delete(alarms.SentPoAlarms, msg.message)
+		alarms.notifyMux.Unlock()
+		return nil
+	}
+	if msg.severity != "critical" {
+		return nil
+	}
 	if !shouldNotify(msg, po) {
 		return nil
 	}
 	priority := msg.poPriority
-	if msg.resolved && priority > 0 {
-		priority = 0 // never emergency-resolve
-	}
 	form := url.Values{}
 	form.Set("token", msg.poToken)
 	form.Set("user", msg.poUser)
 	form.Set("message", msg.message)
-	title := "🚨 ALERT: " + msg.chain
-	if msg.resolved {
-		title = "💜 Resolved: " + msg.chain
-	}
-	form.Set("title", title)
+	form.Set("title", "🚨 ALERT: "+msg.chain)
 	form.Set("priority", strconv.Itoa(priority))
 	if priority == 2 {
 		form.Set("retry", strconv.Itoa(msg.poRetry))
@@ -503,12 +511,33 @@ func stalledTransition(stalledAlerts bool, lastBlockAlarm bool, lastBlockTime ti
 	}
 }
 
+// inactiveTransition decides the validator-inactive (jailed/tombstoned) alarm
+// transition and mirrors stalledTransition: the resolve decision is driven by
+// whether the alarm is actually present in the cache (alarmActive = hasMessage),
+// not by the bonded-state diff alone. The bonded diff can persist between health
+// refreshes for up to a minute (gnoMonitorHealth ticks every minute), so without
+// the cache gate watch() would re-fire the resolve every 2s tick and shouldNotify
+// would spam "no corresponding alert" for every sink — the prod log noise seen
+// when a gno validator was transiently misread as inactive and then recovered.
+func inactiveTransition(alertIfInactive, lastBonded, curBonded, alarmActive bool) string {
+	if !alertIfInactive {
+		return ""
+	}
+	switch {
+	case !curBonded && lastBonded && !alarmActive:
+		return "fire"
+	case curBonded && !lastBonded && alarmActive:
+		return "resolve"
+	default:
+		return ""
+	}
+}
+
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
 // Node-lag detection (node behind head) runs in monitorHealth via nodeLagCheck().
 func (cc *ChainConfig) watch() {
 	var missedAlarm, pctAlarm, noNodes bool
-	inactive := "jailed"
 	nodeAlarms := make(map[string]bool)
 
 	// wait until we have a moniker:
@@ -595,32 +624,24 @@ func (cc *ChainConfig) watch() {
 			alarms.clearNoBlocks(cc.name)
 		}
 
-		// jailed detection - only alert if it changes.
-		if cc.Alerts.AlertIfInactive && cc.lastValInfo != nil && cc.lastValInfo.Bonded != cc.valInfo.Bonded &&
-			cc.lastValInfo.Moniker == cc.valInfo.Moniker {
-
+		// jailed/inactive detection - only alert on a real transition. The resolve
+		// decision is gated on the alarm actually being present in the cache
+		// (persistent source of truth), the same pattern as the stalled alarm;
+		// otherwise a bonded-state diff that lingers until the next health refresh
+		// would re-fire the resolve every 2s tick and spam "no corresponding alert".
+		if cc.lastValInfo != nil && cc.lastValInfo.Moniker == cc.valInfo.Moniker {
+			inactive := "jailed"
+			if cc.valInfo.Tombstoned {
+				// don't worry about changing it back ... lol.
+				inactive = "☠️ tombstoned 🪦"
+			}
+			inactiveMsg := fmt.Sprintf("%s is no longer active: validator is %s", cc.valInfo.Moniker, inactive)
 			id := cc.valInfo.Valcons + "jailed"
-			// just went inactive, figure out if it's jail or tombstone
-			if !cc.valInfo.Bonded && cc.lastValInfo.Bonded {
-				if cc.valInfo.Tombstoned {
-					// don't worry about changing it back ... lol.
-					inactive = "☠️ tombstoned 🪦"
-				}
-				td.alert(
-					cc.name,
-					fmt.Sprintf("%s is no longer active: validator is %s", cc.valInfo.Moniker, inactive),
-					"critical",
-					false,
-					&id,
-				)
-			} else if cc.valInfo.Bonded && !cc.lastValInfo.Bonded {
-				td.alert(
-					cc.name,
-					fmt.Sprintf("%s is no longer active: validator is %s", cc.valInfo.Moniker, inactive),
-					"info",
-					true,
-					&id,
-				)
+			switch inactiveTransition(cc.Alerts.AlertIfInactive, cc.lastValInfo.Bonded, cc.valInfo.Bonded, alarms.hasMessage(cc.name, inactiveMsg)) {
+			case "fire":
+				td.alert(cc.name, inactiveMsg, "critical", false, &id)
+			case "resolve":
+				td.alert(cc.name, inactiveMsg, "info", true, &id)
 			}
 		}
 
