@@ -62,3 +62,20 @@ func TestEncrypt(t *testing.T) {
 	}
 
 }
+
+func TestDecryptStripsFullBlockPadding(t *testing.T) {
+	plain := bytes.Repeat([]byte("a"), 32)
+	password := "not-common-password-123"
+
+	cipherText, err := encrypt(plain, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decrypt(cipherText, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plain, got) {
+		t.Fatalf("plaintext mismatch for block-aligned input: got len %d, want %d", len(got), len(plain))
+	}
+}

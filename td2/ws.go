@@ -80,7 +80,10 @@ func (cc *ChainConfig) WsRun() {
 	started := time.Now()
 	for {
 		// wait until our RPC client is connected and running. We will use the same URL for the websocket
-		if cc.client == nil || cc.valInfo == nil || cc.valInfo.Conspub == nil {
+		cc.stateMux.RLock()
+		waiting := cc.client == nil || cc.valInfo == nil || cc.valInfo.Conspub == nil
+		cc.stateMux.RUnlock()
+		if waiting {
 			if started.Before(time.Now().Add(-2 * time.Minute)) {
 				l(cc.name, "websocket client timed out waiting for a working rpc endpoint, restarting")
 				return
@@ -92,7 +95,10 @@ func (cc *ChainConfig) WsRun() {
 		break
 	}
 
-	cc.wsclient, err = NewClient(cc.client.Remote(), true)
+	cc.stateMux.RLock()
+	rpcClient := cc.client
+	cc.stateMux.RUnlock()
+	cc.wsclient, err = NewClient(rpcClient.Remote(), true)
 	if err != nil {
 		l(err)
 		cancel()
@@ -112,6 +118,7 @@ func (cc *ChainConfig) WsRun() {
 		for {
 			select {
 			case update := <-resultChan:
+				cc.stateMux.Lock()
 				if update.Final && update.Height%20 == 0 {
 					l(fmt.Sprintf("🧊 %-12s block %d", cc.ChainId, update.Height))
 				}
@@ -121,7 +128,7 @@ func (cc *ChainConfig) WsRun() {
 				if update.Final {
 					cc.lastBlockNum = update.Height
 					if td.Prom {
-						td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
+						td.statsChan <- cc.mkUpdateWithMoniker(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "", cc.valInfo.Moniker)
 					}
 					cc.lastBlockTime = time.Now()
 					cc.lastBlockAlarm = false
@@ -192,20 +199,21 @@ func (cc *ChainConfig) WsRun() {
 							ActiveAlerts: cc.activeAlerts,
 							Height:       update.Height,
 							LastError:    info,
-							Blocks:       cc.blocksResults,
+							Blocks:       append([]int(nil), cc.blocksResults...),
 						}
 					}
 
 					if td.Prom {
-						td.statsChan <- cc.mkUpdate(metricSigned, cc.statTotalSigns, "")
-						td.statsChan <- cc.mkUpdate(metricProposed, cc.statTotalProps, "")
-						td.statsChan <- cc.mkUpdate(metricMissed, cc.statTotalMiss, "")
-						td.statsChan <- cc.mkUpdate(metricPrevote, cc.statPrevoteMiss, "")
-						td.statsChan <- cc.mkUpdate(metricPrecommit, cc.statPrecommitMiss, "")
-						td.statsChan <- cc.mkUpdate(metricConsecutive, cc.statConsecutiveMiss, "")
-						td.statsChan <- cc.mkUpdate(metricUnealthyNodes, float64(len(cc.Nodes)-healthyNodes), "")
+						td.statsChan <- cc.mkUpdateWithMoniker(metricSigned, cc.statTotalSigns, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricProposed, cc.statTotalProps, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricMissed, cc.statTotalMiss, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricPrevote, cc.statPrevoteMiss, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricPrecommit, cc.statPrecommitMiss, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricConsecutive, cc.statConsecutiveMiss, "", cc.valInfo.Moniker)
+						td.statsChan <- cc.mkUpdateWithMoniker(metricUnealthyNodes, float64(len(cc.Nodes)-healthyNodes), "", cc.valInfo.Moniker)
 					}
 				}
+				cc.stateMux.Unlock()
 			case <-ctx.Done():
 				return
 			}
@@ -213,11 +221,14 @@ func (cc *ChainConfig) WsRun() {
 	}()
 
 	voteChan := make(chan *WsReply)
-	go handleVotes(ctx, voteChan, resultChan, strings.ToUpper(hex.EncodeToString(cc.valInfo.Conspub)))
+	cc.stateMux.RLock()
+	conspub := append([]byte(nil), cc.valInfo.Conspub...)
+	cc.stateMux.RUnlock()
+	go handleVotes(ctx, voteChan, resultChan, strings.ToUpper(hex.EncodeToString(conspub)))
 
 	blockChan := make(chan *WsReply)
 	go func() {
-		e := handleBlocks(ctx, blockChan, resultChan, strings.ToUpper(hex.EncodeToString(cc.valInfo.Conspub)))
+		e := handleBlocks(ctx, blockChan, resultChan, strings.ToUpper(hex.EncodeToString(conspub)))
 		if e != nil {
 			l("🛑", cc.ChainId, e)
 			cancel()
@@ -260,10 +271,10 @@ func (cc *ChainConfig) WsRun() {
 			break
 		}
 	}
-	l(fmt.Sprintf("⚙️ %-12s watching for NewBlock and Vote events via %s", cc.ChainId, cc.client.Remote()))
+	l(fmt.Sprintf("⚙️ %-12s watching for NewBlock and Vote events via %s", cc.ChainId, rpcClient.Remote()))
 	for {
 		select {
-		case <-cc.client.Quit():
+		case <-rpcClient.Quit():
 			cancel()
 		case <-ctx.Done():
 			return

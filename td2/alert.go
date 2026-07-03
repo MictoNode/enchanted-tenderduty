@@ -533,6 +533,21 @@ func inactiveTransition(alertIfInactive, lastBonded, curBonded, alarmActive bool
 	}
 }
 
+func percentageMissedTransition(percentageAlerts bool, pctAlarm bool, missed int64, window int64, limit int) string {
+	if !percentageAlerts || window <= 0 {
+		return ""
+	}
+	overLimit := 100*float64(missed)/float64(window) > float64(limit)
+	switch {
+	case overLimit && !pctAlarm:
+		return "fire"
+	case !overLimit && pctAlarm:
+		return "resolve"
+	default:
+		return ""
+	}
+}
+
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
 // Node-lag detection (node behind head) runs in monitorHealth via nodeLagCheck().
@@ -543,16 +558,24 @@ func (cc *ChainConfig) watch() {
 	// wait until we have a moniker:
 	noNodesSec := 0 // delay a no-nodes alarm for 30 seconds, too noisy.
 	for {
-		if cc.valInfo == nil || cc.valInfo.Moniker == "not connected" {
+		cc.stateMux.RLock()
+		waiting := cc.valInfo == nil || cc.valInfo.Moniker == "not connected"
+		noNodesActive := cc.noNodes
+		valcons := ""
+		if cc.valInfo != nil {
+			valcons = cc.valInfo.Valcons
+		}
+		cc.stateMux.RUnlock()
+		if waiting {
 			time.Sleep(time.Second)
-			if cc.Alerts.AlertIfNoServers && !noNodes && cc.noNodes && noNodesSec >= 60*td.NodeDownMin {
+			if cc.Alerts.AlertIfNoServers && !noNodes && noNodesActive && noNodesSec >= 60*td.NodeDownMin {
 				noNodes = true
 				td.alert(
 					cc.name,
 					fmt.Sprintf("no RPC endpoints are working for %s", cc.ChainId),
 					"critical",
 					false,
-					&cc.valInfo.Valcons,
+					&valcons,
 				)
 			}
 			noNodesSec += 1
@@ -570,6 +593,7 @@ func (cc *ChainConfig) watch() {
 
 	for {
 		time.Sleep(2 * time.Second)
+		cc.stateMux.Lock()
 
 		// alert if we can't monitor
 		switch {
@@ -673,7 +697,8 @@ func (cc *ChainConfig) watch() {
 		}
 
 		// window percentage missed block alarms
-		if cc.Alerts.PercentageAlerts && !pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) > float64(cc.Alerts.Window) {
+		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, pctAlarm, cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
+		case "fire":
 			// alert on missed block counter!
 			pctAlarm = true
 			id := cc.valInfo.Valcons + "percent"
@@ -685,7 +710,7 @@ func (cc *ChainConfig) watch() {
 				&id,
 			)
 			cc.activeAlerts = alarms.getCount(cc.name)
-		} else if cc.Alerts.PercentageAlerts && pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) < float64(cc.Alerts.Window) {
+		case "resolve":
 			// clear the alert
 			pctAlarm = false
 			id := cc.valInfo.Valcons + "percent"
@@ -693,7 +718,7 @@ func (cc *ChainConfig) watch() {
 				cc.name,
 				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
 				"info",
-				false,
+				true,
 				&id,
 			)
 			cc.activeAlerts = alarms.getCount(cc.name)
@@ -735,13 +760,14 @@ func (cc *ChainConfig) watch() {
 
 		if td.Prom {
 			// raw block timer, ignoring finalized state
-			td.statsChan <- cc.mkUpdate(metricLastBlockSecondsNotFinal, time.Since(cc.lastBlockTime).Seconds(), "")
+			td.statsChan <- cc.mkUpdateWithMoniker(metricLastBlockSecondsNotFinal, time.Since(cc.lastBlockTime).Seconds(), "", cc.valInfo.Moniker)
 			// update node-down times for prometheus
 			for _, node := range cc.Nodes {
 				if node.down && !node.downSince.IsZero() {
-					td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, time.Since(node.downSince).Seconds(), node.Url)
+					td.statsChan <- cc.mkUpdateWithMoniker(metricNodeDownSeconds, time.Since(node.downSince).Seconds(), node.Url, cc.valInfo.Moniker)
 				}
 			}
 		}
+		cc.stateMux.Unlock()
 	}
 }

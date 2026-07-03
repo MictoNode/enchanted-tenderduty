@@ -33,9 +33,14 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 	if cc.Type == "gnoland" {
 		return cc.GnoGetValInfo(first)
 	}
-	if cc.client == nil {
+	cc.stateMux.RLock()
+	client := cc.client
+	cc.stateMux.RUnlock()
+	if client == nil {
 		return errors.New("nil rpc client")
 	}
+	cc.stateMux.Lock()
+	defer cc.stateMux.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -46,7 +51,7 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 	// Fetch info from /cosmos.staking.v1beta1.Query/Validator
 	// it's easier to ask people to provide valoper since it's readily available on
 	// explorers, so make it easy and lookup the consensus key for them.
-	cc.valInfo.Conspub, cc.valInfo.Moniker, cc.valInfo.Jailed, cc.valInfo.Bonded, err = getVal(ctx, cc.client, cc.ValAddress)
+	cc.valInfo.Conspub, cc.valInfo.Moniker, cc.valInfo.Jailed, cc.valInfo.Bonded, err = getVal(ctx, client, cc.ValAddress)
 	if err != nil {
 		return
 	}
@@ -94,7 +99,7 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 	if err != nil {
 		return
 	}
-	resp, err := cc.client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/SigningInfo", b)
+	resp, err := client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/SigningInfo", b)
 	if resp == nil || resp.Response.Value == nil {
 		err = errors.New("could not query validator slashing status, got empty response")
 		return
@@ -110,7 +115,7 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 	}
 	cc.valInfo.Missed = slash.ValSigningInfo.MissedBlocksCounter
 	if td.Prom {
-		td.statsChan <- cc.mkUpdate(metricWindowMissed, float64(cc.valInfo.Missed), "")
+		td.statsChan <- cc.mkUpdateWithMoniker(metricWindowMissed, float64(cc.valInfo.Missed), "", cc.valInfo.Moniker)
 	}
 
 	// finally get the signed blocks window
@@ -120,7 +125,7 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 		if err != nil {
 			return
 		}
-		resp, err = cc.client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/Params", b)
+		resp, err = client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/Params", b)
 		if err != nil {
 			return
 		}
@@ -134,8 +139,8 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 			return
 		}
 		if first && td.Prom {
-			td.statsChan <- cc.mkUpdate(metricWindowSize, float64(params.Params.SignedBlocksWindow), "")
-			td.statsChan <- cc.mkUpdate(metricTotalNodes, float64(len(cc.Nodes)), "")
+			td.statsChan <- cc.mkUpdateWithMoniker(metricWindowSize, float64(params.Params.SignedBlocksWindow), "", cc.valInfo.Moniker)
+			td.statsChan <- cc.mkUpdateWithMoniker(metricTotalNodes, float64(len(cc.Nodes)), "", cc.valInfo.Moniker)
 		}
 		cc.valInfo.Window = params.Params.SignedBlocksWindow
 	}

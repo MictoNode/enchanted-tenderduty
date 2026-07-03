@@ -231,6 +231,8 @@ func GnoResolveValoper(rpcURL, realmPath, operatorAddr string) (moniker, signing
 
 // gnoRPCUrl returns the first node URL that isn't marked down (fallback: first node).
 func (cc *ChainConfig) gnoRPCUrl() string {
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
 	for _, n := range cc.Nodes {
 		if !n.down {
 			return n.Url
@@ -252,10 +254,14 @@ func (cc *ChainConfig) gnoRPCUrl() string {
 // keeps the prior bonded state instead of treating the validator as inactive.
 func (cc *ChainConfig) gnoCheckBonded(signingAddr string) (bonded, ok bool) {
 	for _, n := range cc.Nodes {
-		if n.down {
+		cc.stateMux.RLock()
+		down := n.down
+		url := n.Url
+		cc.stateMux.RUnlock()
+		if down {
 			continue
 		}
-		b, err := GnoIsValidatorActive(n.Url, signingAddr)
+		b, err := GnoIsValidatorActive(url, signingAddr)
 		if err != nil {
 			continue
 		}
@@ -274,9 +280,11 @@ func (cc *ChainConfig) gnoCheckBonded(signingAddr string) (bonded, ok bool) {
 // resolved from the valopers realm and stored in valInfo.Valcons; all
 // consensus-level matching then goes through Valcons, not the operator address.
 func (cc *ChainConfig) GnoGetValInfo(first bool) error {
+	cc.stateMux.Lock()
 	if cc.valInfo == nil {
 		cc.valInfo = &ValInfo{}
 	}
+	cc.stateMux.Unlock()
 	rpcURL := cc.gnoRPCUrl()
 	if rpcURL == "" {
 		return errors.New("no RPC URL available")
@@ -299,13 +307,6 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 			moniker = cc.ValAddress
 		}
 	}
-	cc.valInfo.Moniker = moniker
-	cc.valInfo.Tombstoned = false // gno has no evidence/tombstone path
-	cc.valInfo.Valcons = signingAddr
-	if signingAddr != "" {
-		cc.valInfo.Conspub = []byte(signingAddr)
-	}
-
 	// Active-set check uses the signing (consensus) address — that is what
 	// /validators lists. Polls every non-down node and treats the validator as
 	// bonded if ANY healthy node lists it (poll-all); a transient error or lag on
@@ -320,11 +321,20 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 		} else {
 			// indeterminate: keep the last known bonded state so a transient
 			// all-endpoints failure can't raise a false "jailed" alarm
+			cc.stateMux.RLock()
 			bonded = cc.valInfo.Bonded
+			cc.stateMux.RUnlock()
 			if first {
 				l(fmt.Sprintf("⚠️ could not check active set for %s: all RPC endpoints failed", signingAddr))
 			}
 		}
+	}
+	cc.stateMux.Lock()
+	cc.valInfo.Moniker = moniker
+	cc.valInfo.Tombstoned = false // gno has no evidence/tombstone path
+	cc.valInfo.Valcons = signingAddr
+	if signingAddr != "" {
+		cc.valInfo.Conspub = []byte(signingAddr)
 	}
 	// jailed detection: validator left the active set since last refresh
 	if cc.lastValInfo != nil && cc.lastValInfo.Bonded && !bonded {
@@ -333,15 +343,18 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 		cc.valInfo.Jailed = false
 	}
 	cc.valInfo.Bonded = bonded
+	logMoniker := cc.valInfo.Moniker
+	logBonded := cc.valInfo.Bonded
+	cc.stateMux.Unlock()
 
 	if first {
 		switch {
-		case cc.valInfo.Bonded:
-			l(fmt.Sprintf("⚙️ found %s (operator %s, signing %s) in active validator set", cc.valInfo.Moniker, cc.ValAddress, signingAddr))
+		case logBonded:
+			l(fmt.Sprintf("⚙️ found %s (operator %s, signing %s) in active validator set", logMoniker, cc.ValAddress, signingAddr))
 		case signingAddr == "":
 			l(fmt.Sprintf("❌ %s: signing address unresolved — not monitoring missed blocks", cc.ChainId))
 		default:
-			l(fmt.Sprintf("❌ %s (operator %s, signing %s) NOT in active validator set", cc.valInfo.Moniker, cc.ValAddress, signingAddr))
+			l(fmt.Sprintf("❌ %s (operator %s, signing %s) NOT in active validator set", logMoniker, cc.ValAddress, signingAddr))
 		}
 	}
 	return nil
@@ -352,54 +365,73 @@ func (cc *ChainConfig) gnoNewRpc() error {
 	for _, ep := range cc.Nodes {
 		cid, _, catching, err := GnoGetStatus(ep.Url)
 		if err != nil {
+			cc.stateMux.Lock()
 			if !ep.down {
 				ep.down = true
 				ep.downSince = time.Now()
 			}
 			ep.lastMsg = fmt.Sprintf("❌ gno status failed %s: %s", ep.Url, err)
-			l(ep.lastMsg)
+			msg := ep.lastMsg
+			cc.stateMux.Unlock()
+			l(msg)
 			continue
 		}
 		if cid != cc.ChainId {
+			cc.stateMux.Lock()
 			if !ep.down {
 				ep.down = true
 				ep.downSince = time.Now()
 			}
 			ep.lastMsg = fmt.Sprintf("chain id %s on %s does not match %s", cid, ep.Url, cc.ChainId)
-			l(ep.lastMsg)
+			msg := ep.lastMsg
+			cc.stateMux.Unlock()
+			l(msg)
 			continue
 		}
 		if catching {
+			cc.stateMux.Lock()
 			if !ep.down {
 				ep.down = true
 				ep.downSince = time.Now()
 			}
 			ep.syncing = true
 			ep.lastMsg = "🐢 gno node not synced: " + ep.Url
-			l(ep.lastMsg)
+			msg := ep.lastMsg
+			cc.stateMux.Unlock()
+			l(msg)
 			continue
 		}
+		cc.stateMux.Lock()
 		ep.down = false
 		ep.syncing = false
 		ep.downSince = time.Unix(0, 0)
 		ep.lastMsg = ""
 		cc.gnoRpcEndpoint = ep.Url
 		cc.noNodes = false
+		cc.stateMux.Unlock()
 		return nil
 	}
 	if cc.PublicFallback {
 		l("no public fallback available for gnoland chain", cc.ChainId)
 	}
-	cc.noNodes = true
 	alarms.clearAll(cc.name)
+	cc.stateMux.Lock()
+	cc.noNodes = true
 	cc.lastError = "no usable RPC endpoints available for " + cc.ChainId
+	lastError := cc.lastError
+	status := &dash.ChainStatus{
+		MsgType: "status", Name: cc.name, ChainId: cc.ChainId, Network: cc.Network,
+		Nodes: len(cc.Nodes), HealthyNodes: 0, ActiveAlerts: 1, LastError: lastError,
+		Blocks: append([]int(nil), cc.blocksResults...),
+	}
+	if cc.valInfo != nil {
+		status.Moniker = cc.valInfo.Moniker
+		status.Bonded = cc.valInfo.Bonded
+		status.Jailed = cc.valInfo.Jailed
+	}
+	cc.stateMux.Unlock()
 	if td.EnableDash {
-		td.updateChan <- &dash.ChainStatus{
-			MsgType: "status", Name: cc.name, ChainId: cc.ChainId, Network: cc.Network,
-			Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded, Jailed: cc.valInfo.Jailed,
-			Nodes: len(cc.Nodes), HealthyNodes: 0, ActiveAlerts: 1, LastError: cc.lastError,
-			Blocks: cc.blocksResults,
-		}
+		td.updateChan <- status
 	}
 	return errors.New("no usable endpoints available for " + cc.ChainId)
 }
@@ -413,7 +445,10 @@ func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			head, _, _, _ := GnoGetStatus(cc.gnoRpcEndpoint)
+			cc.stateMux.RLock()
+			rpcEndpoint := cc.gnoRpcEndpoint
+			cc.stateMux.RUnlock()
+			head, _, _, _ := GnoGetStatus(rpcEndpoint)
 			headH, _ := strconv.ParseInt(head, 10, 64)
 			for _, node := range cc.Nodes {
 				_, nh, catching, err := GnoGetStatus(node.Url)
@@ -425,9 +460,12 @@ func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
 				h, _ := strconv.ParseInt(nh, 10, 64)
 				nodeLagCheck(cc, node, headH-h)
 				if catching {
+					cc.stateMux.Lock()
 					node.syncing = true
+					cc.stateMux.Unlock()
 					continue
 				}
+				cc.stateMux.Lock()
 				if node.down {
 					node.lastMsg = ""
 					node.wasDown = true
@@ -436,10 +474,12 @@ func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
 				node.syncing = false
 				node.downSince = time.Unix(0, 0)
 				cc.noNodes = false
+				cc.stateMux.Unlock()
 				if td.Prom {
 					td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, 0, node.Url)
 				}
 			}
+			cc.stateMux.Lock()
 			if cc.valInfo != nil {
 				cc.lastValInfo = &ValInfo{
 					Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded, Jailed: cc.valInfo.Jailed,
@@ -447,6 +487,7 @@ func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
 					Conspub: cc.valInfo.Conspub, Valcons: cc.valInfo.Valcons,
 				}
 			}
+			cc.stateMux.Unlock()
 			if e := cc.GnoGetValInfo(false); e != nil {
 				l("❓ refreshing gno validator info for", cc.ValAddress, e)
 			}
@@ -456,8 +497,10 @@ func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
 
 // alertNodeDown marks a gno node down so the shared watch() loop fires the node-down alert.
 func alertNodeDown(cc *ChainConfig, node *NodeConfig, msg string) {
+	cc.stateMux.Lock()
 	if !node.AlertIfDown {
 		node.down = true
+		cc.stateMux.Unlock()
 		return
 	}
 	if !node.down {
@@ -465,5 +508,7 @@ func alertNodeDown(cc *ChainConfig, node *NodeConfig, msg string) {
 		node.downSince = time.Now()
 	}
 	node.lastMsg = fmt.Sprintf("%-12s node %s is %s", cc.name, node.Url, msg)
-	l("⚠️ " + node.lastMsg)
+	lastMsg := node.lastMsg
+	cc.stateMux.Unlock()
+	l("⚠️ " + lastMsg)
 }

@@ -44,7 +44,10 @@ func gnoSignState(valAddr string, br *pollBlockResult) StatusType {
 func (cc *ChainConfig) PollRun() {
 	started := time.Now()
 	for {
-		if cc.gnoRpcEndpoint == "" || cc.valInfo == nil {
+		cc.stateMux.RLock()
+		waiting := cc.gnoRpcEndpoint == "" || cc.valInfo == nil
+		cc.stateMux.RUnlock()
+		if waiting {
 			if started.Before(time.Now().Add(-2 * time.Minute)) {
 				l(cc.name, "poller timed out waiting for endpoint")
 				return
@@ -59,7 +62,13 @@ func (cc *ChainConfig) PollRun() {
 	// Without the signing (consensus) address, resolved from the valopers realm
 	// into valInfo.Valcons, precommits can never be matched. Block monitoring is
 	// impossible in that state; node-down/stalled alerts still work via watch().
-	if cc.valInfo.Valcons == "" {
+	cc.stateMux.RLock()
+	valcons := ""
+	if cc.valInfo != nil {
+		valcons = cc.valInfo.Valcons
+	}
+	cc.stateMux.RUnlock()
+	if valcons == "" {
 		l(fmt.Sprintf("🛑 %-12s no signing address resolved from realm; block monitoring inactive", cc.ChainId))
 		return
 	}
@@ -69,7 +78,9 @@ func (cc *ChainConfig) PollRun() {
 	if windowSize <= 0 {
 		windowSize = 10000
 	}
+	cc.stateMux.Lock()
 	cc.gnoWin = newGnoWindow(windowSize)
+	cc.stateMux.Unlock()
 	var lastHeight int64
 	noBlockSince := time.Now()
 	tick := time.NewTicker(5 * time.Second)
@@ -88,10 +99,14 @@ func (cc *ChainConfig) PollRun() {
 			var bestHeight int64 = -1
 			for i := range cc.Nodes {
 				node := cc.Nodes[i]
-				if node.down {
+				cc.stateMux.RLock()
+				down := node.down
+				nodeURL := node.Url
+				cc.stateMux.RUnlock()
+				if down {
 					continue
 				}
-				url := strings.TrimRight(node.Url, "/") + "/block"
+				url := strings.TrimRight(nodeURL, "/") + "/block"
 				client := &http.Client{Timeout: 10 * time.Second}
 				resp, err := client.Get(url)
 				if err != nil {
@@ -124,13 +139,14 @@ func (cc *ChainConfig) PollRun() {
 			noBlockSince = time.Now()
 			lastHeight = bestHeight
 
+			cc.stateMux.Lock()
 			signState := gnoSignState(cc.valInfo.Valcons, bestBR)
 			if bestHeight%20 == 0 {
 				l(fmt.Sprintf("🧊 %-12s block %d", cc.ChainId, bestHeight))
 			}
 			cc.lastBlockNum = bestHeight
 			if td.Prom {
-				td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
+				td.statsChan <- cc.mkUpdateWithMoniker(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "", cc.valInfo.Moniker)
 			}
 			cc.lastBlockTime = time.Now()
 			cc.lastBlockAlarm = false
@@ -188,16 +204,17 @@ func (cc *ChainConfig) PollRun() {
 					Bonded: cc.valInfo.Bonded, Jailed: cc.valInfo.Jailed, Tombstoned: cc.valInfo.Tombstoned,
 					Missed: cc.valInfo.Missed, Window: cc.valInfo.Window, Nodes: len(cc.Nodes),
 					HealthyNodes: healthyNodes, ActiveAlerts: cc.activeAlerts, Height: bestHeight,
-					LastError: info, Blocks: cc.blocksResults,
+					LastError: info, Blocks: append([]int(nil), cc.blocksResults...),
 				}
 			}
 			if td.Prom {
-				td.statsChan <- cc.mkUpdate(metricSigned, cc.statTotalSigns, "")
-				td.statsChan <- cc.mkUpdate(metricProposed, cc.statTotalProps, "")
-				td.statsChan <- cc.mkUpdate(metricMissed, cc.statTotalMiss, "")
-				td.statsChan <- cc.mkUpdate(metricConsecutive, cc.statConsecutiveMiss, "")
-				td.statsChan <- cc.mkUpdate(metricUnealthyNodes, float64(len(cc.Nodes)-healthyNodes), "")
+				td.statsChan <- cc.mkUpdateWithMoniker(metricSigned, cc.statTotalSigns, "", cc.valInfo.Moniker)
+				td.statsChan <- cc.mkUpdateWithMoniker(metricProposed, cc.statTotalProps, "", cc.valInfo.Moniker)
+				td.statsChan <- cc.mkUpdateWithMoniker(metricMissed, cc.statTotalMiss, "", cc.valInfo.Moniker)
+				td.statsChan <- cc.mkUpdateWithMoniker(metricConsecutive, cc.statConsecutiveMiss, "", cc.valInfo.Moniker)
+				td.statsChan <- cc.mkUpdateWithMoniker(metricUnealthyNodes, float64(len(cc.Nodes)-healthyNodes), "", cc.valInfo.Moniker)
 			}
+			cc.stateMux.Unlock()
 		case <-td.ctx.Done():
 			return
 		}

@@ -24,7 +24,10 @@ func (cc *ChainConfig) newRpc() error {
 	defer cancel()
 	var anyWorking bool // if healthchecks are running, we will skip to the first known good node.
 	for _, endpoint := range cc.Nodes {
-		anyWorking = anyWorking || !endpoint.down
+		cc.stateMux.RLock()
+		down := endpoint.down
+		cc.stateMux.RUnlock()
+		anyWorking = anyWorking || !down
 	}
 	// grab the first working endpoint
 	tryUrl := func(u string) (msg string, down, syncing bool) {
@@ -35,14 +38,14 @@ func (cc *ChainConfig) newRpc() error {
 			down = true
 			return
 		}
-		cc.client, err = rpchttp.New(u, "/websocket")
+		client, err := rpchttp.New(u, "/websocket")
 		if err != nil {
 			msg = fmt.Sprintf("❌ could not connect client for %s: (%s) %s", cc.name, u, err)
 			l(msg)
 			down = true
 			return
 		}
-		status, err := cc.client.Status(ctx)
+		status, err := client.Status(ctx)
 		if err != nil {
 			msg = fmt.Sprintf("❌ could not get status for %s: (%s) %s", cc.name, u, err)
 			down = true
@@ -62,10 +65,15 @@ func (cc *ChainConfig) newRpc() error {
 			l(msg)
 			return
 		}
+		cc.stateMux.Lock()
+		cc.client = client
 		cc.noNodes = false
+		cc.stateMux.Unlock()
 		return
 	}
 	down := func(endpoint *NodeConfig, msg string) {
+		cc.stateMux.Lock()
+		defer cc.stateMux.Unlock()
 		if !endpoint.down {
 			endpoint.down = true
 			endpoint.downSince = time.Now()
@@ -73,7 +81,10 @@ func (cc *ChainConfig) newRpc() error {
 		endpoint.lastMsg = msg
 	}
 	for _, endpoint := range cc.Nodes {
-		if anyWorking && endpoint.down {
+		cc.stateMux.RLock()
+		endpointDown := endpoint.down
+		cc.stateMux.RUnlock()
+		if anyWorking && endpointDown {
 			continue
 		}
 		if msg, failed, syncing := tryUrl(endpoint.Url); failed {
@@ -95,27 +106,32 @@ func (cc *ChainConfig) newRpc() error {
 			l("could not find a public endpoint for", cc.ChainId)
 		}
 	}
-	cc.noNodes = true
 	alarms.clearAll(cc.name)
+	cc.stateMux.Lock()
+	cc.noNodes = true
 	cc.lastError = "no usable RPC endpoints available for " + cc.ChainId
+	status := &dash.ChainStatus{
+		MsgType: "status",
+		Name:    cc.name,
+		ChainId: cc.ChainId, Network: cc.Network,
+		Nodes:        len(cc.Nodes),
+		HealthyNodes: 0,
+		ActiveAlerts: 1,
+		Height:       0,
+		LastError:    cc.lastError,
+		Blocks:       append([]int(nil), cc.blocksResults...),
+	}
+	if cc.valInfo != nil {
+		status.Moniker = cc.valInfo.Moniker
+		status.Bonded = cc.valInfo.Bonded
+		status.Jailed = cc.valInfo.Jailed
+		status.Tombstoned = cc.valInfo.Tombstoned
+		status.Missed = cc.valInfo.Missed
+		status.Window = cc.valInfo.Window
+	}
+	cc.stateMux.Unlock()
 	if td.EnableDash {
-		td.updateChan <- &dash.ChainStatus{
-			MsgType: "status",
-			Name:    cc.name,
-			ChainId: cc.ChainId, Network: cc.Network,
-			Moniker:      cc.valInfo.Moniker,
-			Bonded:       cc.valInfo.Bonded,
-			Jailed:       cc.valInfo.Jailed,
-			Tombstoned:   cc.valInfo.Tombstoned,
-			Missed:       cc.valInfo.Missed,
-			Window:       cc.valInfo.Window,
-			Nodes:        len(cc.Nodes),
-			HealthyNodes: 0,
-			ActiveAlerts: 1,
-			Height:       0,
-			LastError:    cc.lastError,
-			Blocks:       cc.blocksResults,
-		}
+		td.updateChan <- status
 	}
 	return errors.New("no usable endpoints available for " + cc.ChainId)
 }
@@ -141,7 +157,10 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 		return
 	}
 	tick := time.NewTicker(time.Minute)
-	if cc.client == nil {
+	cc.stateMux.RLock()
+	clientNil := cc.client == nil
+	cc.stateMux.RUnlock()
+	if clientNil {
 		_ = cc.newRpc()
 	}
 
@@ -155,20 +174,25 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 			for _, node := range cc.Nodes {
 				go func(node *NodeConfig) {
 					alert := func(msg string) {
+						cc.stateMux.Lock()
 						node.lastMsg = fmt.Sprintf("%-12s node %s is %s", chainName, node.Url, msg)
 						if !node.AlertIfDown {
 							// even if we aren't alerting, we want to display the status in the dashboard.
 							node.down = true
+							cc.stateMux.Unlock()
 							return
 						}
 						if !node.down {
 							node.down = true
 							node.downSince = time.Now()
 						}
+						downSince := node.downSince
+						lastMsg := node.lastMsg
+						cc.stateMux.Unlock()
 						if td.Prom {
-							td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, time.Since(node.downSince).Seconds(), node.Url)
+							td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, time.Since(downSince).Seconds(), node.Url)
 						}
-						l("⚠️ " + node.lastMsg)
+						l("⚠️ " + lastMsg)
 					}
 					c, e := rpchttp.New(node.Url, "/websocket")
 					if e != nil {
@@ -187,33 +211,44 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 					}
 					if status.SyncInfo.CatchingUp {
 						alert("not synced")
+						cc.stateMux.Lock()
 						node.syncing = true
+						cc.stateMux.Unlock()
 						return
 					}
 
 					// lag detection against the head we know from the websocket stream
-					nodeLagCheck(cc, node, cc.lastBlockNum-status.SyncInfo.LatestBlockHeight)
+					cc.stateMux.RLock()
+					lastBlockNum := cc.lastBlockNum
+					cc.stateMux.RUnlock()
+					nodeLagCheck(cc, node, lastBlockNum-status.SyncInfo.LatestBlockHeight)
 
 					// node's OK, clear the note
+					cc.stateMux.Lock()
 					if node.down {
 						node.lastMsg = ""
 						node.wasDown = true
 					}
-					td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, 0, node.Url)
 					node.down = false
 					node.syncing = false
 					node.downSince = time.Unix(0, 0)
 					cc.noNodes = false
+					cc.stateMux.Unlock()
+					td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, 0, node.Url)
 					l(fmt.Sprintf("🟢 %-12s node %s is healthy", chainName, node.Url))
 				}(node)
 			}
 
-			if cc.client == nil {
+			cc.stateMux.RLock()
+			clientNil = cc.client == nil
+			cc.stateMux.RUnlock()
+			if clientNil {
 				e := cc.newRpc()
 				if e != nil {
 					l("💥", cc.ChainId, e)
 				}
 			}
+			cc.stateMux.Lock()
 			if cc.valInfo != nil {
 				cc.lastValInfo = &ValInfo{
 					Moniker:    cc.valInfo.Moniker,
@@ -226,6 +261,7 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 					Valcons:    cc.valInfo.Valcons,
 				}
 			}
+			cc.stateMux.Unlock()
 			err = cc.GetValInfo(false)
 			if err != nil {
 				l("❓ refreshing signing info for", cc.ValAddress, err)

@@ -130,10 +130,7 @@ func decrypt(encodedFile []byte, password string) (plainText []byte, err error) 
 	if err != nil {
 		return
 	}
-	// decoding can leave null bytes at the end of our slice, which will result in an invalid hmac key
-	for cipherText[len(cipherText)-1] == 0 {
-		cipherText = cipherText[:len(cipherText)-1]
-	}
+	cipherText = cipherText[:size]
 
 	if size <= 2*idKeySize+ivSize {
 		err = errors.New("ciphertext is too short")
@@ -174,9 +171,17 @@ func decrypt(encodedFile []byte, password string) (plainText []byte, err error) 
 
 	// strip padding
 	padLen := int(plainText[len(plainText)-1])
-	if (len(plainText)-padLen)%block.BlockSize() != 0 {
-		return plainText[:len(plainText)-padLen], nil
+	if padLen == 0 || padLen > block.BlockSize() || padLen > len(plainText) {
+		err = errors.New("invalid padding")
+		return
 	}
+	for _, b := range plainText[len(plainText)-padLen:] {
+		if int(b) != padLen {
+			err = errors.New("invalid padding")
+			return
+		}
+	}
+	plainText = plainText[:len(plainText)-padLen]
 	return
 }
 

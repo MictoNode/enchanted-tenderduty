@@ -16,7 +16,7 @@ func TestStalledTransition(t *testing.T) {
 	now := time.Date(2026, 6, 28, 9, 50, 0, 0, time.UTC)
 	stalledMin := 3
 	threshold := time.Duration(stalledMin) * time.Minute
-	recent := now.Add(-1 * time.Minute)      // within threshold, healthy
+	recent := now.Add(-1 * time.Minute)            // within threshold, healthy
 	stale := now.Add(-threshold).Add(-time.Second) // just past threshold, stalled
 
 	cases := []struct {
@@ -79,6 +79,37 @@ func TestInactiveTransition(t *testing.T) {
 			if got != c.want {
 				t.Fatalf("inactiveTransition(%v,%v,%v,%v) = %q, want %q",
 					c.alerts, c.lastBonded, c.curBonded, c.alarmActive, got, c.want)
+			}
+		})
+	}
+}
+
+func TestPercentageMissedTransition(t *testing.T) {
+	cases := []struct {
+		name   string
+		alerts bool
+		alarm  bool
+		missed int64
+		window int64
+		limit  int
+		want   string
+	}{
+		{"fire when over threshold and no alarm", true, false, 6, 10, 50, "fire"},
+		{"no-op when over threshold and already alarmed", true, true, 6, 10, 50, ""},
+		{"resolve when recovered under threshold", true, true, 4, 10, 50, "resolve"},
+		{"no-op when healthy and no alarm", true, false, 4, 10, 50, ""},
+		{"equal threshold is not over", true, false, 5, 10, 50, ""},
+		{"zero window is ignored", true, false, 1, 0, 50, ""},
+		{"disabled: no fire", false, false, 6, 10, 50, ""},
+		{"disabled: no resolve", false, true, 4, 10, 50, ""},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := percentageMissedTransition(c.alerts, c.alarm, c.missed, c.window, c.limit)
+			if got != c.want {
+				t.Fatalf("percentageMissedTransition(%v,%v,%d,%d,%d) = %q, want %q",
+					c.alerts, c.alarm, c.missed, c.window, c.limit, got, c.want)
 			}
 		})
 	}

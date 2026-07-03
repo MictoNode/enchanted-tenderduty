@@ -152,11 +152,14 @@ func saveOnExit(stateFile string, saved chan interface{}) {
 		// only need to save counts if the dashboard exists
 		if td.EnableDash {
 			for k, v := range td.Chains {
-				blocks[k] = v.blocksResults
+				v.stateMux.RLock()
+				blocks[k] = append([]int(nil), v.blocksResults...)
+				v.stateMux.RUnlock()
 			}
 		}
 		nodesDown := make(map[string]map[string]time.Time)
 		for k, v := range td.Chains {
+			v.stateMux.RLock()
 			for _, node := range v.Nodes {
 				if node.down {
 					if nodesDown[k] == nil {
@@ -165,15 +168,18 @@ func saveOnExit(stateFile string, saved chan interface{}) {
 					nodesDown[k][node.Url] = node.downSince
 				}
 			}
+			v.stateMux.RUnlock()
 		}
 		gnoCounters := make(map[string]*gnoSavedStats)
 		for k, v := range td.Chains {
+			v.stateMux.RLock()
 			if v.Type == "gnoland" && v.valInfo != nil {
 				gnoCounters[k] = &gnoSavedStats{
 					TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
 					TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
 				}
 			}
+			v.stateMux.RUnlock()
 		}
 		b, e := json.Marshal(&savedState{
 			Alarms:      alarms,

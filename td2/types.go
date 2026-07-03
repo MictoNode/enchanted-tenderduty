@@ -99,6 +99,7 @@ type gnoSavedStats struct {
 // ChainConfig represents a validator to be monitored on a chain, it is somewhat of a misnomer since multiple
 // validators can be monitored on a single chain.
 type ChainConfig struct {
+	stateMux       sync.RWMutex
 	name           string
 	wsclient       *TmConn       // custom websocket client to work around wss:// bugs in tendermint
 	client         *rpchttp.HTTP // legit tendermint client
@@ -161,12 +162,22 @@ type ChainConfig struct {
 
 // mkUpdate returns the info needed by prometheus for a gauge.
 func (cc *ChainConfig) mkUpdate(t metricType, v float64, node string) *promUpdate {
+	cc.stateMux.RLock()
+	moniker := ""
+	if cc.valInfo != nil {
+		moniker = cc.valInfo.Moniker
+	}
+	cc.stateMux.RUnlock()
+	return cc.mkUpdateWithMoniker(t, v, node, moniker)
+}
+
+func (cc *ChainConfig) mkUpdateWithMoniker(t metricType, v float64, node string, moniker string) *promUpdate {
 	return &promUpdate{
 		metric:   t,
 		counter:  v,
 		name:     cc.name,
 		chainId:  cc.ChainId,
-		moniker:  cc.valInfo.Moniker,
+		moniker:  moniker,
 		endpoint: node,
 	}
 }
@@ -411,7 +422,7 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		case !v.Alerts.ConsecutiveAlerts && !v.Alerts.PercentageAlerts && !v.Alerts.AlertIfInactive && !v.Alerts.AlertIfNoServers:
 			problems = append(problems, fmt.Sprintf("warn: %20s has no alert types configured", k))
 			fallthrough
-		case !v.Alerts.Pagerduty.Enabled && !v.Alerts.Discord.Enabled && !v.Alerts.Telegram.Enabled && !v.Alerts.Slack.Enabled:
+		case !v.Alerts.Pagerduty.Enabled && !v.Alerts.Discord.Enabled && !v.Alerts.Telegram.Enabled && !v.Alerts.Slack.Enabled && !v.Alerts.Pushover.Enabled:
 			problems = append(problems, fmt.Sprintf("warn: %20s has no notifications configured", k))
 		}
 		if td.EnableDash {
@@ -640,6 +651,10 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 			alarms.SentSlkAlarms = saved.Alarms.SentSlkAlarms
 			clearStale(alarms.SentSlkAlarms, "Slack", c.Pagerduty.Enabled, staleHours)
 		}
+		if saved.Alarms.SentPoAlarms != nil {
+			alarms.SentPoAlarms = saved.Alarms.SentPoAlarms
+			clearStale(alarms.SentPoAlarms, "Pushover", c.Pagerduty.Enabled, staleHours)
+		}
 		if saved.Alarms.AllAlarms != nil {
 			alarms.AllAlarms = saved.Alarms.AllAlarms
 			for _, alrm := range saved.Alarms.AllAlarms {
@@ -686,12 +701,12 @@ func clearStale(alarms map[string]time.Time, what string, hasPagerduty bool, hou
 	for k := range alarms {
 		if time.Since(alarms[k]).Hours() >= hours {
 			l(fmt.Sprintf("🗑 not restoring old alarm (%v >%.2f hours) from cache - %s", alarms[k], hours, k))
-			if hasPagerduty && what == "pagerduty" {
+			if hasPagerduty && strings.EqualFold(what, "pagerduty") {
 				l("NOTE: stale alarms may need to be manually cleared from PagerDuty!")
 			}
 			delete(alarms, k)
 			continue
 		}
-		l("📂 restored %s alarm state -", what, k)
+		l(fmt.Sprintf("📂 restored %s alarm state - %s", what, k))
 	}
 }
