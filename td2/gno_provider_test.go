@@ -213,6 +213,94 @@ func TestGnoGetValInfoBondedAndJailed(t *testing.T) {
 	}
 }
 
+// TestGnoGetValInfoPreservesStateOnRealmFailure reproduces the 2026-07-28 prod
+// false "validator is jailed" critical alarm: the single topaz RPC started
+// serving an HTML error page, GnoResolveValoper failed, and the refresh wiped
+// Bonded to false (and Valcons to "") because the active-set check is skipped
+// when the signing address is unknown. The next refresh with the realm back —
+// but /validators still failing — preserved the already-wiped false state, and
+// watch() saw a true->false transition: false jailed -> Pushover emergency.
+// A realm/RPC failure must preserve the previously resolved identity and bonded
+// state; only a healthy /validators answer may change them.
+func TestGnoGetValInfoPreservesStateOnRealmFailure(t *testing.T) {
+	operator := "abcdef0123456789abcdef0123456789abcdef01" // realm key (config valoper_address)
+	signing := "1111111123456789abcdef0123456789abcdef01"  // consensus addr (/validators, /block)
+	realmDown := false
+	validatorsDown := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/abci_query", func(w http.ResponseWriter, r *http.Request) {
+		if realmDown {
+			w.Write([]byte(`<html>bad gateway</html>`)) // the prod HTML error page
+			return
+		}
+		decoded := gnoValoperStruct("GnoVal", operator, "gpub1pk", signing)
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"response":{"ResponseBase":{"Data":"` + b64(decoded) + `"}}}}`))
+	})
+	mux.HandleFunc("/validators", func(w http.ResponseWriter, r *http.Request) {
+		if validatorsDown {
+			w.Write([]byte(`<html>bad gateway</html>`))
+			return
+		}
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"validators":[{"address":"` + signing + `"}]}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cc := &ChainConfig{
+		name: "gno", ChainId: "test11", Type: "gnoland",
+		ValAddress: operator, Nodes: []*NodeConfig{{Url: srv.URL}},
+	}
+	// Healthy baseline: realm resolves, validator bonded.
+	if err := cc.GnoGetValInfo(true); err != nil {
+		t.Fatalf("baseline err: %v", err)
+	}
+	if !cc.valInfo.Bonded || !addrEqual(signing, cc.valInfo.Valcons) || cc.valInfo.Moniker != "GnoVal" {
+		t.Fatalf("baseline wrong: bonded=%v valcons=%q moniker=%q", cc.valInfo.Bonded, cc.valInfo.Valcons, cc.valInfo.Moniker)
+	}
+
+	// Whole RPC flaps: realm + /validators both fail. Known-good state must survive.
+	realmDown, validatorsDown = true, true
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("refresh err: %v", err)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("realm failure must not wipe bonded state (false jailed root cause)")
+	}
+	if !addrEqual(signing, cc.valInfo.Valcons) {
+		t.Fatalf("realm failure must not wipe signing addr, got %q", cc.valInfo.Valcons)
+	}
+	if cc.valInfo.Moniker != "GnoVal" {
+		t.Fatalf("realm failure should keep the known moniker, got %q", cc.valInfo.Moniker)
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("transient realm failure must not mark the validator jailed")
+	}
+
+	// Realm recovers while /validators is still down (prod 07:15:42): the preserved
+	// bonded state must be kept (all-endpoints-failed path), not flipped to false.
+	cc.lastValInfo = &ValInfo{Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded}
+	realmDown = false
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("refresh err: %v", err)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("realm-recovered refresh must preserve bonded when /validators is unreachable")
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("no jailed transition allowed on preserved state")
+	}
+
+	// /validators recovers (realm still failing): the real check must run against
+	// the preserved signing addr and confirm bonded — state stays accurate.
+	realmDown, validatorsDown = true, false
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("refresh err: %v", err)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("healthy /validators must confirm bonded via the preserved signing addr")
+	}
+}
+
 // TestGnoCheckBondedPollsAllNodes proves the active-set check polls every
 // non-down node and treats the validator as bonded when ANY healthy node reports
 // it active. This is the poll-all philosophy: a single stale/lagging endpoint —

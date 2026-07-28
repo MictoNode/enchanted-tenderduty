@@ -301,11 +301,23 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 			l(fmt.Sprintf("⚠️ could not resolve valoper %s from realm: %s", cc.ValAddress, rErr))
 			l(fmt.Sprintf("⚠️ %s: signing address unknown — missed-block monitoring inactive (set valoper_address to the operator address shown on gnoweb)", cc.ChainId))
 		}
-		if len(cc.ValAddress) >= 20 {
+		// A failed realm query (transient RPC trouble, e.g. an HTML error page)
+		// must not wipe the previously resolved identity and bonded state: keep
+		// them and let the active-set check below decide — it already preserves
+		// the prior bonded state when every endpoint fails. Without this, one
+		// failed qeval zeroes Bonded/Valcons, and the next refresh with the realm
+		// back sees a true->false transition and raises a false "jailed" alarm.
+		cc.stateMux.RLock()
+		prevMoniker, prevValcons := cc.valInfo.Moniker, cc.valInfo.Valcons
+		cc.stateMux.RUnlock()
+		if prevMoniker != "" && prevMoniker != "not connected" {
+			moniker = prevMoniker
+		} else if len(cc.ValAddress) >= 20 {
 			moniker = cc.ValAddress[:20] + "..."
 		} else {
 			moniker = cc.ValAddress
 		}
+		signingAddr = prevValcons
 	}
 	// Active-set check uses the signing (consensus) address — that is what
 	// /validators lists. Polls every non-down node and treats the validator as
