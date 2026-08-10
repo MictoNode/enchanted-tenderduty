@@ -258,21 +258,6 @@ func GnoResolveValoper(rpcURL, realmPath, operatorAddr string) (moniker, signing
 	return moniker, signingAddr, pubkey, nil
 }
 
-// gnoRPCUrl returns the first node URL that isn't marked down (fallback: first node).
-func (cc *ChainConfig) gnoRPCUrl() string {
-	cc.stateMux.RLock()
-	defer cc.stateMux.RUnlock()
-	for _, n := range cc.Nodes {
-		if !n.down {
-			return n.Url
-		}
-	}
-	if len(cc.Nodes) > 0 {
-		return cc.Nodes[0].Url
-	}
-	return ""
-}
-
 // gnoCheckBonded reports whether the signing (consensus) address is in the active
 // validator set, querying every non-down node. It mirrors the poll-all philosophy
 // of PollRun: a single stale/lagging endpoint — or a transient /validators error
@@ -314,17 +299,41 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 		cc.valInfo = &ValInfo{}
 	}
 	cc.stateMux.Unlock()
-	rpcURL := cc.gnoRPCUrl()
-	if rpcURL == "" {
-		return errors.New("no RPC URL available")
-	}
 
 	realm := cc.GnoValopersRealm
 	if realm == "" {
 		realm = "gno.land/r/gnops/valopers"
 	}
 
-	moniker, signingAddr, _, rErr := GnoResolveValoper(rpcURL, realm, cc.ValAddress)
+	// Realm resolution is poll-all, mirroring gnoCheckBonded and PollRun: every
+	// non-down node is tried and the first successful answer wins. A single node
+	// whose abci_query (vm/qeval) times out — but whose /status still works, so
+	// it is never marked down — must not disable monitoring while a healthy
+	// second node goes unused (prod 2026-08-10 19:39 episode: topaz-1 looped
+	// "could not resolve valoper ... from realm" every ~15s for ~50s, dashboard
+	// Inactive, until the realm answer finally came back). When every node fails
+	// (or none exist) the last error is remembered and the preserve path below
+	// keeps the previously resolved identity, exactly like the old single-
+	// endpoint behavior.
+	rErr := errors.New("no RPC URL available")
+	var moniker, signingAddr string
+	for _, n := range cc.Nodes {
+		cc.stateMux.RLock()
+		down := n.down
+		url := n.Url
+		cc.stateMux.RUnlock()
+		if down {
+			continue
+		}
+		m, s, _, err := GnoResolveValoper(url, realm, cc.ValAddress)
+		if err != nil {
+			rErr = err
+			continue
+		}
+		moniker, signingAddr = m, s
+		rErr = nil
+		break
+	}
 	if rErr != nil {
 		if first {
 			l(fmt.Sprintf("⚠️ could not resolve valoper %s from realm: %s", cc.ValAddress, rErr))

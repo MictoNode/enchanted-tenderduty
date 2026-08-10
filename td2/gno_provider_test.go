@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cosmos/cosmos-sdk/types/bech32"
@@ -531,4 +532,134 @@ func TestGnoCheckBondedPollsAllNodes(t *testing.T) {
 			t.Fatal("expected bonded=false when indeterminate")
 		}
 	})
+}
+
+// TestGnoGetValInfoResolvesRealmViaSecondNode proves realm resolution is
+// poll-all across cc.Nodes, mirroring gnoCheckBonded/PollRun: the first node's
+// abci_query (vm/qeval) fails fast (500 + HTML error page, the same error class
+// as the prod timeout loop) and GnoGetValInfo must fall through to the second
+// node, resolve the realm there, and confirm bonded via that same node. A
+// single node whose abci_query times out — but whose /status still works, so it
+// is never marked down — must not disable monitoring (prod 2026-08-10 19:39
+// episode: topaz-1 looped ~50s with "could not resolve valoper ... from realm"
+// while the second node was never tried).
+func TestGnoGetValInfoResolvesRealmViaSecondNode(t *testing.T) {
+	operator := "abcdef0123456789abcdef0123456789abcdef01" // realm key (config valoper_address)
+	signing := "1111111123456789abcdef0123456789abcdef01"  // consensus addr (/validators, /block)
+
+	// First node: every path fails fast (500 + HTML error page). No sleep
+	// handlers — a fast error body exercises the exact same fallback path as a
+	// timeout without slowing the test.
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`<html>bad gateway</html>`))
+	}))
+	defer badSrv.Close()
+
+	goodMux := http.NewServeMux()
+	goodMux.HandleFunc("/abci_query", func(w http.ResponseWriter, r *http.Request) {
+		decoded := gnoValoperStruct("GnoVal", operator, "gpub1pk", signing)
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"response":{"ResponseBase":{"Data":"` + b64(decoded) + `"}}}}`))
+	})
+	goodMux.HandleFunc("/validators", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"validators":[{"address":"` + signing + `"}]}}`))
+	})
+	goodSrv := httptest.NewServer(goodMux)
+	defer goodSrv.Close()
+
+	cc := &ChainConfig{
+		name: "gno", ChainId: "test11", Type: "gnoland",
+		ValAddress: operator, Nodes: []*NodeConfig{{Url: badSrv.URL}, {Url: goodSrv.URL}},
+	}
+	if err := cc.GnoGetValInfo(true); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if cc.valInfo.Moniker != "GnoVal" {
+		t.Fatalf("moniker: want GnoVal (via second node), got %q", cc.valInfo.Moniker)
+	}
+	if !addrEqual(signing, cc.valInfo.Valcons) {
+		t.Fatalf("valcons: want signing %s, got %q", signing, cc.valInfo.Valcons)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("expected bonded: second node's /validators lists the signing addr")
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("should not be jailed on first refresh")
+	}
+}
+
+// TestGnoGetValInfoAllNodesRealmFailPreservesState proves the poll-all realm
+// loop degrades exactly like the old single-endpoint path when EVERY node's
+// abci_query fails: on first boot the signing address stays unresolved, Bonded
+// stays false and the moniker falls back to the truncated operator address;
+// with prior state set the prior Moniker/Valcons are preserved (the 2026-07-28
+// false-jailed regression guard). Both nodes must be queried — the loop keeps
+// trying past a failure — unlike the old sticky gnoRPCUrl, which stopped at the
+// first node.
+func TestGnoGetValInfoAllNodesRealmFailPreservesState(t *testing.T) {
+	operator := "abcdef0123456789abcdef0123456789abcdef01" // realm key (config valoper_address)
+	signing := "1111111123456789abcdef0123456789abcdef01"  // consensus addr (/validators, /block)
+
+	var hitsA, hitsB int32
+	failSrv := func(hits *int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "abci_query") {
+				atomic.AddInt32(hits, 1)
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`<html>bad gateway</html>`))
+		}))
+	}
+	srvA := failSrv(&hitsA)
+	defer srvA.Close()
+	srvB := failSrv(&hitsB)
+	defer srvB.Close()
+
+	cc := &ChainConfig{
+		name: "gno", ChainId: "test11", Type: "gnoland",
+		ValAddress: operator, Nodes: []*NodeConfig{{Url: srvA.URL}, {Url: srvB.URL}},
+	}
+
+	// First boot: realm never resolves; both nodes must have been tried.
+	if err := cc.GnoGetValInfo(true); err != nil {
+		t.Fatalf("first boot err: %v", err)
+	}
+	if atomic.LoadInt32(&hitsA) == 0 || atomic.LoadInt32(&hitsB) == 0 {
+		t.Fatalf("both nodes must be queried for realm resolution: hitsA=%d hitsB=%d", atomic.LoadInt32(&hitsA), atomic.LoadInt32(&hitsB))
+	}
+	if cc.valInfo.Valcons != "" {
+		t.Fatalf("first boot: signing must stay unresolved, got %q", cc.valInfo.Valcons)
+	}
+	if cc.valInfo.Bonded {
+		t.Fatal("first boot: must stay unbonded when realm never resolves")
+	}
+	if cc.valInfo.Moniker != operator[:20]+"..." {
+		t.Fatalf("first boot moniker: want truncated operator %q, got %q", operator[:20]+"...", cc.valInfo.Moniker)
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("first boot: must not be jailed")
+	}
+
+	// Prior state set: a later all-realm-fail refresh must preserve it.
+	cc.stateMux.Lock()
+	cc.valInfo.Moniker = "PriorMoniker"
+	cc.valInfo.Valcons = signing
+	cc.valInfo.Bonded = true
+	cc.lastValInfo = &ValInfo{Moniker: "PriorMoniker", Bonded: true}
+	cc.stateMux.Unlock()
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("refresh err: %v", err)
+	}
+	if cc.valInfo.Moniker != "PriorMoniker" {
+		t.Fatalf("realm failure must preserve prior moniker, got %q", cc.valInfo.Moniker)
+	}
+	if !addrEqual(signing, cc.valInfo.Valcons) {
+		t.Fatalf("realm failure must preserve prior signing addr, got %q", cc.valInfo.Valcons)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("realm failure must preserve prior bonded state (false-jailed regression guard)")
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("realm failure must not mark the validator jailed")
+	}
 }
