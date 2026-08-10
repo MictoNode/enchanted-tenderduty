@@ -22,6 +22,17 @@ import (
 
 var hexAddrRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// gnoBondedConfirmTicks is the number of consecutive definitive not-bonded
+// /validators answers required before a gno validator flips to Bonded=false.
+// A single transient tick used to flip immediately, raising a false "jailed"
+// critical alert, painting ~10 "No Data" cells in the block grid, and
+// self-recovering ~60s later (2026-08-10 prod incident; same class as
+// 2026-07-02 and 2026-07-28). Bonded state may only change on a healthy
+// /validators answer, and a real unbond persists across ticks, so requiring
+// two consecutive definitive answers cannot delay a genuine unbond by more
+// than one health tick (~1 min).
+const gnoBondedConfirmTicks = 2
+
 // canonicalAddr decodes a validator address given in hex (40 hex chars) or bech32
 // form into its 20-byte consensus address. gno.land endpoints mix encodings
 // (/validators may be bech32 g1..., /block proposer/precommits are hex), so all
@@ -89,10 +100,16 @@ type GnoStatusResult struct {
 	} `json:"result"`
 }
 
-// GnoValidatorsResult is the /validators RPC response.
+// GnoValidatorsResult is the /validators RPC response. Error mirrors the shape
+// of GnoABCIResult.Error: TM2 returns a JSON-RPC error object ({"error":{...}})
+// on failure, and without checking it a zero-value struct used to be returned
+// as a silent "definitely not in the active set" (2026-08-10 prod incident).
 type GnoValidatorsResult struct {
 	JSONRPC string `json:"jsonrpc"`
-	Result  struct {
+	Error   *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	Result struct {
 		Validators []GnoValidator `json:"validators"`
 	} `json:"result"`
 }
@@ -126,6 +143,18 @@ func GnoGetValidators(rpcURL string) ([]GnoValidator, error) {
 	var res GnoValidatorsResult
 	if err = json.Unmarshal(body, &res); err != nil {
 		return nil, err
+	}
+	if res.Error != nil {
+		return nil, fmt.Errorf("validators error: %s", res.Error.Message)
+	}
+	// A healthy live chain always lists its active set; an empty/missing
+	// validators list (result:null, {}, or a malformed error body that
+	// unmarshals into a zero struct) is therefore indeterminate, NOT a
+	// definitive "not in the active set". Returning (nil, nil) here used to
+	// silently flip a bonded validator to Bonded=false, painting "No Data" in
+	// the grid and raising a false "jailed" critical (2026-08-10 incident).
+	if len(res.Result.Validators) == 0 {
+		return nil, errors.New("empty validators response")
 	}
 	return res.Result.Validators, nil
 }
@@ -324,15 +353,33 @@ func (cc *ChainConfig) GnoGetValInfo(first bool) error {
 	// bonded if ANY healthy node lists it (poll-all); a transient error or lag on
 	// one endpoint must not flip a bonded validator to inactive (false "jailed").
 	// When every endpoint fails (indeterminate) the prior bonded state is kept.
+	// A definitive not-bonded verdict is debounced across gnoBondedConfirmTicks
+	// consecutive ticks before Bonded flips to false, so one transient tick can't
+	// raise a false "jailed" critical + "No Data" grid (2026-08-10 incident).
 	// Skipped when the signing address is unknown.
 	bonded := false
 	if signingAddr != "" {
 		b, ok := cc.gnoCheckBonded(signingAddr)
-		if ok {
-			bonded = b
-		} else {
+		switch {
+		case ok && b:
+			// definitive bonded: reset the miss streak
+			cc.stateMux.Lock()
+			cc.gnoBondMissStreak = 0
+			cc.stateMux.Unlock()
+			bonded = true
+		case ok && !b:
+			// definitive not-bonded: require consecutive ticks before flipping
+			cc.stateMux.Lock()
+			cc.gnoBondMissStreak++
+			bonded = cc.valInfo.Bonded // preserve until confirmed
+			if cc.gnoBondMissStreak >= gnoBondedConfirmTicks {
+				bonded = false
+			}
+			cc.stateMux.Unlock()
+		default:
 			// indeterminate: keep the last known bonded state so a transient
-			// all-endpoints failure can't raise a false "jailed" alarm
+			// all-endpoints failure can't raise a false "jailed" alarm; the
+			// streak is left unchanged too
 			cc.stateMux.RLock()
 			bonded = cc.valInfo.Bonded
 			cc.stateMux.RUnlock()

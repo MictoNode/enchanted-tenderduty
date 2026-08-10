@@ -92,6 +92,176 @@ func TestGnoIsValidatorActive(t *testing.T) {
 	}
 }
 
+// TestGnoGetValidatorsErrorOnJSONRPCError proves a JSON-RPC error body
+// ({"error":{...}}) is surfaced as an error instead of silently unmarshaling
+// into a zero-value struct and reporting "definitely not in the active set".
+// That silent (nil, nil) was the 2026-08-10 prod incident root cause: an
+// intermittent error body flipped a bonded validator to Bonded=false, painted
+// ~10 "No Data" grid cells, and raised a false "jailed" critical alert.
+func TestGnoGetValidatorsErrorOnJSONRPCError(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":-1,"error":{"code":-32603,"message":"internal error"}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	if _, err := GnoGetValidators(srv.URL); err == nil {
+		t.Fatal("expected error for JSON-RPC error body")
+	}
+}
+
+// TestGnoGetValidatorsErrorOnEmptyResult proves an empty /validators answer is
+// an error, not a definitive "not in the active set": a healthy live chain
+// always lists its active set, so an empty set means the response was
+// indeterminate and the caller must preserve prior state (2026-08-10 incident:
+// result:null / missing validators unmarshaled into a zero struct -> (nil, nil)
+// -> silent Bonded=false -> false jailed).
+func TestGnoGetValidatorsErrorOnEmptyResult(t *testing.T) {
+	for _, body := range []string{
+		`{}`,
+		`{"jsonrpc":"2.0","result":null}`,
+		`{"jsonrpc":"2.0","result":{"validators":[]}}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+		_, err := GnoGetValidators(srv.URL)
+		srv.Close()
+		if err == nil {
+			t.Fatalf("expected error for body %s", body)
+		}
+	}
+}
+
+// TestGnoIsValidatorActiveAbsentHealthyResponse proves the real-unbond path is
+// preserved: a HEALTHY populated response that lacks the signing address still
+// returns (false, nil) — only empty/error responses are indeterminate now.
+func TestGnoIsValidatorActiveAbsentHealthyResponse(t *testing.T) {
+	body := `{"jsonrpc":"2.0","result":{"validators":[{"address":"0000000000000000000000000000000000000000"}]}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	active, err := GnoIsValidatorActive(srv.URL, "1111111123456789abcdef0123456789abcdef01")
+	if err != nil {
+		t.Fatalf("healthy populated response must not error: %v", err)
+	}
+	if active {
+		t.Fatal("address absent from healthy set must report inactive, not error")
+	}
+}
+
+// TestGnoGetValInfoDebouncesNotBondedTicks proves the single-tick false-flip
+// debounce (2026-08-10 prod incident class, same as 2026-07-02/2026-07-28): a
+// definitive not-bonded /validators verdict must be confirmed across two
+// consecutive ticks before Bonded flips to false (and Jailed to true); a
+// bonded verdict resets the streak; an indeterminate verdict (all endpoints
+// failed) leaves the streak unchanged. One transient tick used to flip
+// immediately, painting ~10 "No Data" grid cells and raising a false "jailed"
+// critical that self-recovered ~60s later.
+func TestGnoGetValInfoDebouncesNotBondedTicks(t *testing.T) {
+	mux := http.NewServeMux()
+	operator := "abcdef0123456789abcdef0123456789abcdef01" // realm key (config valoper_address)
+	signing := "1111111123456789abcdef0123456789abcdef01"  // consensus addr (/validators, /block)
+	includeSigning := true
+	validatorsDown := false
+	mux.HandleFunc("/abci_query", func(w http.ResponseWriter, r *http.Request) {
+		decoded := gnoValoperStruct("GnoVal", operator, "gpub1pk", signing)
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"response":{"ResponseBase":{"Data":"` + b64(decoded) + `"}}}}`))
+	})
+	mux.HandleFunc("/validators", func(w http.ResponseWriter, r *http.Request) {
+		if validatorsDown {
+			w.Write([]byte(`<html>bad gateway</html>`))
+			return
+		}
+		if includeSigning {
+			w.Write([]byte(`{"jsonrpc":"2.0","result":{"validators":[{"address":"` + signing + `"}]}}`))
+			return
+		}
+		w.Write([]byte(`{"jsonrpc":"2.0","result":{"validators":[{"address":"0000000000000000000000000000000000000000"}]}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cc := &ChainConfig{
+		name: "gno", ChainId: "test11", Type: "gnoland",
+		ValAddress: operator, Nodes: []*NodeConfig{{Url: srv.URL}},
+	}
+	// Healthy baseline: bonded.
+	if err := cc.GnoGetValInfo(true); err != nil {
+		t.Fatalf("baseline err: %v", err)
+	}
+	if !cc.valInfo.Bonded || cc.valInfo.Jailed {
+		t.Fatalf("baseline wrong: bonded=%v jailed=%v", cc.valInfo.Bonded, cc.valInfo.Jailed)
+	}
+	cc.lastValInfo = &ValInfo{Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded}
+
+	// Tick 1: definitive not-found. One tick must NOT flip the state.
+	includeSigning = false
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("tick1 err: %v", err)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("single not-bonded tick must not flip Bonded (debounce)")
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("single not-bonded tick must not set Jailed")
+	}
+	cc.stateMux.RLock()
+	streak := cc.gnoBondMissStreak
+	cc.stateMux.RUnlock()
+	if streak != 1 {
+		t.Fatalf("streak after tick1: want 1, got %d", streak)
+	}
+
+	// Tick 2: second consecutive not-found -> definitive unbond, flip happens.
+	cc.lastValInfo = &ValInfo{Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded}
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("tick2 err: %v", err)
+	}
+	if cc.valInfo.Bonded {
+		t.Fatal("second consecutive not-bonded tick must flip Bonded=false")
+	}
+	if !cc.valInfo.Jailed {
+		t.Fatal("bonded->unbonded transition must set Jailed=true")
+	}
+
+	// Indeterminate tick (all endpoints fail): preserve state, streak unchanged.
+	cc.lastValInfo = &ValInfo{Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded}
+	validatorsDown = true
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("indeterminate err: %v", err)
+	}
+	if cc.valInfo.Bonded {
+		t.Fatal("indeterminate must preserve prior Bonded=false")
+	}
+	cc.stateMux.RLock()
+	streak = cc.gnoBondMissStreak
+	cc.stateMux.RUnlock()
+	if streak != 2 {
+		t.Fatalf("indeterminate must leave streak unchanged: want 2, got %d", streak)
+	}
+
+	// Bonded verdict: streak resets and state flips back.
+	cc.lastValInfo = &ValInfo{Moniker: cc.valInfo.Moniker, Bonded: cc.valInfo.Bonded}
+	validatorsDown = false
+	includeSigning = true
+	if err := cc.GnoGetValInfo(false); err != nil {
+		t.Fatalf("recover err: %v", err)
+	}
+	if !cc.valInfo.Bonded {
+		t.Fatal("bonded verdict must flip Bonded back to true")
+	}
+	if cc.valInfo.Jailed {
+		t.Fatal("bonded verdict must clear Jailed")
+	}
+	cc.stateMux.RLock()
+	streak = cc.gnoBondMissStreak
+	cc.stateMux.RUnlock()
+	if streak != 0 {
+		t.Fatalf("bonded verdict must reset streak: want 0, got %d", streak)
+	}
+}
+
 // gnoValoperStruct builds a decoded vm/qeval Data payload shaped like the real
 // gno.land/r/gnops/valopers Valoper struct: field order is moniker, description,
 // tag, operator(.uverse.address), pubkey(gpub), signing(.uverse.address),

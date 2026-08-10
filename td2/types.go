@@ -113,7 +113,13 @@ type ChainConfig struct {
 	lastBlockNum   int64
 	gnoRpcEndpoint string     // gno: the working RPC base URL chosen by gnoNewRpc
 	gnoWin         *gnoWindow // gno: sliding signing-health window (gno_signed_blocks_window)
-	activeAlerts   int
+	// gnoBondMissStreak counts consecutive definitive not-bonded /validators
+	// ticks. GnoGetValInfo flips Bonded=false only after gnoBondedConfirmTicks
+	// consecutive verdicts, so one transient tick cannot paint the grid with
+	// "No Data" and raise a false "jailed" critical (2026-08-10 prod incident
+	// class, same as 2026-07-02/2026-07-28). Guarded by stateMux.
+	gnoBondMissStreak int
+	activeAlerts      int
 
 	statTotalSigns      float64
 	statTotalProps      float64
