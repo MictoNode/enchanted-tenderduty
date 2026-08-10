@@ -1,2 +1,15 @@
-# Auto detect text files and perform LF normalization
+# LF line endings enforced for text files (WSL dev).
+# The WSL checkout used to materialize CRLF working copies (Windows-origin
+# leftovers) even though HEAD blobs were LF, which broke publish.sh's anchored
+# greps. eol=lf keeps working trees LF on every platform; PNGs are binary and
+# must never be normalized.
 * text=auto
+*.go text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.png binary
