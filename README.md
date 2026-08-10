@@ -132,6 +132,12 @@ WantedBy=multi-user.target
 EOF
 ```
 
+Make sure the `-o` output path of your build matches `ExecStart` above: the
+unit runs the binary from `$HOME/go/bin/tenderduty`, so build with the
+ldflags command from section 2 (`-o "$(go env GOPATH)/bin/tenderduty"`).
+Building to `./tenderduty` instead silently keeps the old binary running —
+the service stays on the previous build until the paths are aligned.
+
 Enable, start, and follow logs:
 
 ```bash
