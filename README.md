@@ -75,7 +75,8 @@ sudo pacman -S go                  # Arch
 cd $HOME
 git clone https://github.com/MictoNode/enchanted-tenderduty.git
 cd enchanted-tenderduty
-go build -o "$(go env GOPATH)/bin/tenderduty" .   # installs the binary to $HOME/go/bin/tenderduty
+# The binary reports its source commit; check with `tenderduty --version` or the startup log.
+go build -ldflags "-X main.version=$(git describe --tags --always --dirty) -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o "$(go env GOPATH)/bin/tenderduty" .   # installs the binary to $HOME/go/bin/tenderduty
 $HOME/go/bin/tenderduty --help
 ```
 
@@ -148,7 +149,7 @@ you set).
 ```bash
 cd $HOME/enchanted-tenderduty
 git pull
-go build -o "$(go env GOPATH)/bin/tenderduty" .
+go build -ldflags "-X main.version=$(git describe --tags --always --dirty) -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o "$(go env GOPATH)/bin/tenderduty" .
 sudo systemctl restart tenderduty
 ```
 

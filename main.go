@@ -15,9 +15,18 @@ import (
 //go:embed example-config.yml
 var defaultConfig []byte
 
+// version and buildDate are stamped at build time via
+//
+//	-ldflags "-X main.version=... -X main.buildDate=..."
+//
+// so every binary self-reports the source commit it was built from (deploy
+// verification: ./tenderduty --version or the startup log line).
+var version = "dev"
+var buildDate = "unknown"
+
 func main() {
 	var configFile, chainConfigDirectory, stateFile, encryptedFile, password string
-	var dumpConfig, encryptConfig, decryptConfig bool
+	var dumpConfig, encryptConfig, decryptConfig, showVersion bool
 	flag.StringVar(&configFile, "f", "config.yml", "configuration file to use, can also be set with the ENV var 'CONFIG'")
 	flag.StringVar(&encryptedFile, "encrypted-config", "config.yml.asc", "encrypted config file, only valid with -encrypt or -decrypt flag")
 	flag.StringVar(&password, "password", "", "password to use for encrypting/decrypting the config, if unset will prompt, also can use ENV var 'PASSWORD'")
@@ -26,7 +35,13 @@ func main() {
 	flag.BoolVar(&dumpConfig, "example-config", false, "print the an example config.yml and exit")
 	flag.BoolVar(&encryptConfig, "encrypt", false, "encrypt the file specified by -f to -encrypted-config")
 	flag.BoolVar(&decryptConfig, "decrypt", false, "decrypt the file specified by -encrypted-config to -f")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("tenderduty %s (%s)\n", version, buildDate)
+		os.Exit(0)
+	}
 
 	if dumpConfig {
 		fmt.Println(string(defaultConfig))
@@ -65,6 +80,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	log.Println("tenderduty version:", version, "built:", buildDate)
 	err := td2.Run(configFile, stateFile, chainConfigDirectory, &password)
 	if err != nil {
 		log.Println(err.Error(), "... exiting.")
