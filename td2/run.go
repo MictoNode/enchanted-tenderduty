@@ -133,77 +133,125 @@ func Run(configFile, stateFile, chainConfigDirectory string, password *string) e
 	return err
 }
 
+// stateSaveInterval is how often runtime state is persisted while running, so
+// SIGKILL/OOM/power loss loses at most this much state.
+var stateSaveInterval = 60 * time.Second
+
+// snapshotState gathers runtime state and marshals it to JSON. The alarm cache
+// is marshaled under alarms.notifyMux.RLock so concurrent writers can never be
+// observed mid-update.
+func snapshotState() ([]byte, error) {
+	td.chainsMux.Lock()
+	defer td.chainsMux.Unlock()
+	blocks := make(map[string][]int)
+	// only need to save counts if the dashboard exists
+	if td.EnableDash {
+		for k, v := range td.Chains {
+			v.stateMux.RLock()
+			blocks[k] = append([]int(nil), v.blocksResults...)
+			v.stateMux.RUnlock()
+		}
+	}
+	nodesDown := make(map[string]map[string]time.Time)
+	for k, v := range td.Chains {
+		v.stateMux.RLock()
+		for _, node := range v.Nodes {
+			if node.down {
+				if nodesDown[k] == nil {
+					nodesDown[k] = make(map[string]time.Time)
+				}
+				nodesDown[k][node.Url] = node.downSince
+			}
+		}
+		v.stateMux.RUnlock()
+	}
+	gnoCounters := make(map[string]*gnoSavedStats)
+	for k, v := range td.Chains {
+		v.stateMux.RLock()
+		if v.Type == "gnoland" && v.valInfo != nil {
+			gnoCounters[k] = &gnoSavedStats{
+				TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
+				TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
+			}
+		}
+		v.stateMux.RUnlock()
+	}
+	alarms.notifyMux.RLock()
+	defer alarms.notifyMux.RUnlock()
+	return json.Marshal(&savedState{
+		Alarms:      alarms,
+		Blocks:      blocks,
+		NodesDown:   nodesDown,
+		GnoCounters: gnoCounters,
+	})
+}
+
+// writeStateFile writes b to stateFile atomically: the temp file lives in the
+// same directory, so the rename is a same-filesystem atomic replace and a
+// mid-write crash or disk-full never leaves a truncated state file.
+func writeStateFile(stateFile string, b []byte) error {
+	//#nosec -- variable specified on command line
+	f, e := os.OpenFile(stateFile+".tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if e != nil {
+		return e
+	}
+	removeTmp := func() {
+		_ = f.Close()
+		_ = os.Remove(stateFile + ".tmp")
+	}
+	if _, e = f.Write(b); e != nil {
+		removeTmp()
+		return e
+	}
+	if e = f.Sync(); e != nil {
+		removeTmp()
+		return e
+	}
+	if e = f.Close(); e != nil {
+		_ = os.Remove(stateFile + ".tmp")
+		return e
+	}
+	return os.Rename(stateFile+".tmp", stateFile)
+}
+
 func saveOnExit(stateFile string, saved chan interface{}) {
 	quitting := make(chan os.Signal, 1)
 	signal.Notify(quitting, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(quitting)
 
-	saveState := func() {
-		defer close(saved)
-		log.Println("saving state...")
-		//#nosec -- variable specified on command line
-		f, e := os.OpenFile(stateFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	ticker := time.NewTicker(stateSaveInterval)
+	defer ticker.Stop()
+
+	persist := func(exit bool) {
+		if exit {
+			log.Println("saving state...")
+		}
+		b, e := snapshotState()
 		if e != nil {
 			log.Println(e)
 			return
 		}
-		td.chainsMux.Lock()
-		defer td.chainsMux.Unlock()
-		blocks := make(map[string][]int)
-		// only need to save counts if the dashboard exists
-		if td.EnableDash {
-			for k, v := range td.Chains {
-				v.stateMux.RLock()
-				blocks[k] = append([]int(nil), v.blocksResults...)
-				v.stateMux.RUnlock()
-			}
-		}
-		nodesDown := make(map[string]map[string]time.Time)
-		for k, v := range td.Chains {
-			v.stateMux.RLock()
-			for _, node := range v.Nodes {
-				if node.down {
-					if nodesDown[k] == nil {
-						nodesDown[k] = make(map[string]time.Time)
-					}
-					nodesDown[k][node.Url] = node.downSince
-				}
-			}
-			v.stateMux.RUnlock()
-		}
-		gnoCounters := make(map[string]*gnoSavedStats)
-		for k, v := range td.Chains {
-			v.stateMux.RLock()
-			if v.Type == "gnoland" && v.valInfo != nil {
-				gnoCounters[k] = &gnoSavedStats{
-					TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
-					TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
-				}
-			}
-			v.stateMux.RUnlock()
-		}
-		b, e := json.Marshal(&savedState{
-			Alarms:      alarms,
-			Blocks:      blocks,
-			NodesDown:   nodesDown,
-			GnoCounters: gnoCounters,
-		})
-		if e != nil {
+		if e := writeStateFile(stateFile, b); e != nil {
 			log.Println(e)
 			return
 		}
-		_, _ = f.Write(b)
-		_ = f.Close()
-		log.Println("tenderduty exiting.")
+		if exit {
+			log.Println("tenderduty exiting.")
+		}
 	}
 	for {
 		select {
 		case <-td.ctx.Done():
-			saveState()
+			persist(true)
+			close(saved)
 			return
 		case <-quitting:
-			saveState()
+			persist(true)
+			close(saved)
 			td.cancel()
 			return
+		case <-ticker.C:
+			persist(false)
 		}
 	}
 }

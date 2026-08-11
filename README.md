@@ -18,7 +18,7 @@ blocks, stalled chains, jailed/inactive validators, and dead RPC nodes.
 - **Alerts** to Discord, Telegram, Slack, PagerDuty, and **Pushover** (emergency priority that breaks through Do Not Disturb).
 - **Web dashboard** — every chain (cosmos *and* gnoland, testnet *and* mainnet) shows up the same way: bonded/jailed status, missed-block grid, height, active alerts, with mainnet/testnet tabs driven by a per-chain `network` field.
 - **Prometheus exporter** — gauges prefixed `tenderduty_*`.
-- **State persistence** — missed-block counters and alarm state survive restarts.
+- **State persistence** — missed-block counters and alarm state survive restarts; written atomically every 60s while running, so a crash (SIGKILL/OOM/power loss) loses at most ~1 minute of dedup/counter state.
 - Backward compatible — existing cosmos configs keep working unchanged.
 
 ## Requirements
