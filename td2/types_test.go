@@ -9,6 +9,51 @@ import (
 	"time"
 )
 
+// TestStatusUpdateReportsActiveAlarm: watch() pushes a dashboard status when the
+// stalled alarm fires, because no block updates arrive while the chain is halted.
+// Without it the dashboard kept showing the last pre-halt snapshot (2/2 healthy,
+// 0 alerts) for the entire 2026-11-17 onyx-1 halt.
+func TestStatusUpdateReportsActiveAlarm(t *testing.T) {
+	origAlarms := alarms
+	t.Cleanup(func() { alarms = origAlarms })
+	alarms = &alarmCache{AllAlarms: map[string]map[string]time.Time{
+		"Gnoland-T": {"stalled: have not seen a new block on onyx-1 in 3 minutes": time.Now()},
+	}}
+
+	cc := &ChainConfig{
+		name:          "Gnoland-T",
+		ChainId:       "onyx-1",
+		Network:       "testnet",
+		Nodes:         []*NodeConfig{{Url: "https://a"}, {Url: "https://b", down: true}},
+		valInfo:       &ValInfo{Moniker: "MictoNode", Bonded: true, Missed: 2, Window: 100},
+		lastBlockNum:  1203401,
+		blocksResults: []int{3, 3, 3},
+	}
+	st := cc.statusUpdate()
+
+	if st.ActiveAlerts != 1 || cc.activeAlerts != 1 {
+		t.Fatalf("active alerts = %d/%d, want 1", st.ActiveAlerts, cc.activeAlerts)
+	}
+	if st.MsgType != "status" || st.Name != "Gnoland-T" || st.ChainId != "onyx-1" || st.Network != "testnet" {
+		t.Fatalf("bad identity fields: %+v", st)
+	}
+	if st.Height != 1203401 || st.Moniker != "MictoNode" || !st.Bonded || st.Missed != 2 || st.Window != 100 {
+		t.Fatalf("stale runtime state in update: %+v", st)
+	}
+	if st.Nodes != 2 || st.HealthyNodes != 1 {
+		t.Fatalf("nodes = %d/%d, want 2/1", st.HealthyNodes, st.Nodes)
+	}
+	if !strings.Contains(st.LastError, "stalled") {
+		t.Fatalf("active alarm missing from LastError: %q", st.LastError)
+	}
+	// The grid must be a snapshot: the dashboard goroutine consumes it after the
+	// chain lock is released.
+	cc.blocksResults[0] = 4
+	if len(st.Blocks) != 3 || st.Blocks[0] != 3 {
+		t.Fatalf("Blocks is not a copy: %v", st.Blocks)
+	}
+}
+
 func TestChainConfigTypeDefaultsCosmos(t *testing.T) {
 	cc := &ChainConfig{}
 	fatal, _ := validateConfig(&Config{Chains: map[string]*ChainConfig{"x": cc}})

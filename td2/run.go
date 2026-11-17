@@ -137,23 +137,39 @@ func Run(configFile, stateFile, chainConfigDirectory string, password *string) e
 // SIGKILL/OOM/power loss loses at most this much state.
 var stateSaveInterval = 60 * time.Second
 
-// snapshotState gathers runtime state and marshals it to JSON. The alarm cache
-// is marshaled under alarms.notifyMux.RLock so concurrent writers can never be
-// observed mid-update.
+// snapshotState gathers the global runtime state and marshals it to JSON.
 func snapshotState() ([]byte, error) {
-	td.chainsMux.Lock()
-	defer td.chainsMux.Unlock()
+	return snapshotStateOf(td)
+}
+
+// snapshotStateOf gathers c's runtime state and marshals it to JSON. The alarm
+// cache is marshaled under alarms.notifyMux.RLock so concurrent writers can
+// never be observed mid-update.
+func snapshotStateOf(c *Config) ([]byte, error) {
+	// Copy the chain set and release chainsMux before taking any per-chain
+	// stateMux. watch() holds a chain's stateMux and then asks for
+	// chainsMux.RLock (inside Config.alert), so waiting for stateMux while
+	// holding chainsMux is a lock-order inversion that deadlocks both: the
+	// periodic save (60s) would silently stop every alert, save and dashboard
+	// update for the whole process.
+	c.chainsMux.RLock()
+	chains := make(map[string]*ChainConfig, len(c.Chains))
+	for k, v := range c.Chains {
+		chains[k] = v
+	}
+	c.chainsMux.RUnlock()
+
 	blocks := make(map[string][]int)
 	// only need to save counts if the dashboard exists
-	if td.EnableDash {
-		for k, v := range td.Chains {
+	if c.EnableDash {
+		for k, v := range chains {
 			v.stateMux.RLock()
 			blocks[k] = append([]int(nil), v.blocksResults...)
 			v.stateMux.RUnlock()
 		}
 	}
 	nodesDown := make(map[string]map[string]time.Time)
-	for k, v := range td.Chains {
+	for k, v := range chains {
 		v.stateMux.RLock()
 		for _, node := range v.Nodes {
 			if node.down {
@@ -166,7 +182,7 @@ func snapshotState() ([]byte, error) {
 		v.stateMux.RUnlock()
 	}
 	gnoCounters := make(map[string]*gnoSavedStats)
-	for k, v := range td.Chains {
+	for k, v := range chains {
 		v.stateMux.RLock()
 		if v.Type == "gnoland" && v.valInfo != nil {
 			gnoCounters[k] = &gnoSavedStats{

@@ -94,6 +94,59 @@ func TestWriteStateFileAtomic(t *testing.T) {
 	}
 }
 
+// TestSnapshotStateDoesNotDeadlockWatch: watch() holds a chain's stateMux and
+// then takes chainsMux.RLock inside Config.alert, while snapshotState used to
+// hold chainsMux.Lock and only then take each chain's stateMux.RLock. That
+// lock-order inversion deadlocks the whole process as soon as the 60s periodic
+// save overlaps an alert — no alerts, no saves, no dashboard updates.
+func TestSnapshotStateDoesNotDeadlockWatch(t *testing.T) {
+	origAlarms := alarms
+	t.Cleanup(func() { alarms = origAlarms })
+
+	cfg := &Config{
+		alertChan: make(chan *alertMsg, 8),
+		Chains:    map[string]*ChainConfig{"Gnoland-T": {name: "Gnoland-T", ChainId: "onyx-1"}},
+	}
+	alarms = &alarmCache{
+		SentPdAlarms:   map[string]time.Time{},
+		SentTgAlarms:   map[string]time.Time{},
+		SentDiAlarms:   map[string]time.Time{},
+		SentSlkAlarms:  map[string]time.Time{},
+		SentPoAlarms:   map[string]time.Time{},
+		AllAlarms:      map[string]map[string]time.Time{},
+		flappingAlarms: map[string]map[string]time.Time{},
+	}
+
+	cc := cfg.Chains["Gnoland-T"]
+	cc.stateMux.Lock() // what watch() does before raising an alarm
+
+	snapDone := make(chan struct{})
+	go func() { _, _ = snapshotStateOf(cfg); close(snapDone) }()
+	// Give snapshotState time to reach its per-chain lock wait (the old code held
+	// chainsMux.Lock at this point).
+	time.Sleep(100 * time.Millisecond)
+
+	alertDone := make(chan struct{})
+	go func() {
+		cfg.alert("Gnoland-T", "deadlock probe", "critical", false, nil)
+		close(alertDone)
+	}()
+
+	select {
+	case <-alertDone:
+	case <-time.After(2 * time.Second):
+		cc.stateMux.Unlock()
+		t.Fatal("deadlock: snapshotState waits for stateMux while holding chainsMux")
+	}
+
+	cc.stateMux.Unlock()
+	select {
+	case <-snapDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshotState did not complete after the chain lock was released")
+	}
+}
+
 // TestSaveOnExitPeriodicSave: the core new contract — saveOnExit must persist
 // the state while running (periodic tick), before cancel() is ever called.
 func TestSaveOnExitPeriodicSave(t *testing.T) {

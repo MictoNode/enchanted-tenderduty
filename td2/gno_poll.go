@@ -40,6 +40,15 @@ func gnoSignState(valAddr string, br *pollBlockResult) StatusType {
 	return Statusmissed
 }
 
+// gnoPollInterval is how often PollRun polls every configured node for the head
+// block. gnoPollIdleExit is how long PollRun waits with no height advance before
+// returning, so the run loop can re-evaluate the endpoints. Both are vars (not
+// consts) so tests can shorten them.
+var (
+	gnoPollInterval = 5 * time.Second
+	gnoPollIdleExit = 2 * time.Minute
+)
+
 // PollRun replaces the websocket subscription for gnoland: HTTP-poll /block every 5s.
 func (cc *ChainConfig) PollRun() {
 	started := time.Now()
@@ -64,6 +73,12 @@ func (cc *ChainConfig) PollRun() {
 	// impossible in that state; node-down/stalled alerts still work via watch().
 	cc.stateMux.RLock()
 	valcons := ""
+	// Start from the last height actually processed instead of 0. During a chain
+	// halt every poller restart would otherwise treat the frozen head as a brand
+	// new block, refreshing lastBlockTime and silently suppressing the stalled
+	// alarm forever (prod 2026-11-17: onyx-1 halted, no alert for 50+ minutes,
+	// gno window stuck at 1 cell per poller restart).
+	lastHeight := cc.lastBlockNum
 	if cc.valInfo != nil {
 		valcons = cc.valInfo.Valcons
 	}
@@ -81,9 +96,8 @@ func (cc *ChainConfig) PollRun() {
 	cc.stateMux.Lock()
 	cc.gnoWin = newGnoWindow(windowSize)
 	cc.stateMux.Unlock()
-	var lastHeight int64
 	noBlockSince := time.Now()
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(gnoPollInterval)
 	defer tick.Stop()
 
 	for {
@@ -126,15 +140,27 @@ func (cc *ChainConfig) PollRun() {
 				}
 			}
 			if bestBR == nil || bestHeight <= lastHeight {
-				// No node produced an advance this tick. If this persists across every
-				// node for 2 minutes, force a reconnect so gnoNewRpc re-evaluates the
-				// endpoints (mirrors the cosmos websocket's 1-minute idle exit). The
-				// stalled-chain alarm itself is raised by watch() from lastBlockTime.
-				if time.Since(noBlockSince) > 2*time.Minute {
-					l("🛑", cc.ChainId, "no blocks for 2 min, exiting")
-					return
+				// No node produced an advance this tick, so this head is stale and must
+				// not be processed as a new block (that would refresh lastBlockTime and
+				// suppress the stalled alarm). A head that stays BELOW the last
+				// processed height for the whole idle window is a re-genesis (heights
+				// reset), not staleness: accept it so monitoring recovers without a
+				// process restart.
+				if bestBR != nil && bestHeight > 0 && bestHeight < lastHeight &&
+					time.Since(noBlockSince) > gnoPollIdleExit {
+					l(fmt.Sprintf("♻️ %-12s chain height reset to %d (was %d), resuming", cc.ChainId, bestHeight, lastHeight))
+					lastHeight = 0
+				} else {
+					// If this persists across every node for the idle window, force a
+					// reconnect so gnoNewRpc re-evaluates the endpoints (mirrors the
+					// cosmos websocket's idle exit). The stalled-chain alarm itself is
+					// raised by watch() from lastBlockTime.
+					if time.Since(noBlockSince) > gnoPollIdleExit {
+						l("🛑", cc.ChainId, "no blocks for 2 min, exiting")
+						return
+					}
+					continue
 				}
-				continue
 			}
 			noBlockSince = time.Now()
 			lastHeight = bestHeight

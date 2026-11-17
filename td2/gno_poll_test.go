@@ -48,6 +48,123 @@ func withCtx(t *testing.T, ctx context.Context) {
 	t.Cleanup(func() { td.ctx = orig })
 }
 
+// shortenPollTimers makes PollRun's ticker and idle-exit window test-fast and
+// restores the production values after the test.
+func shortenPollTimers(t *testing.T, interval, idle time.Duration) {
+	t.Helper()
+	oi, oe := gnoPollInterval, gnoPollIdleExit
+	gnoPollInterval, gnoPollIdleExit = interval, idle
+	t.Cleanup(func() { gnoPollInterval, gnoPollIdleExit = oi, oe })
+}
+
+// TestPollRunRestartDoesNotAdvanceOnStaleHead is the 2026-11-17 onyx-1 prod
+// regression: the chain halted, PollRun returned on its idle timer, and every
+// restart re-seeded lastHeight to 0 — so the frozen head was processed as a new
+// block, lastBlockTime kept being refreshed, and the stalled alarm (3 min) never
+// fired once in 50+ minutes. A restart must resume from the last processed height.
+func TestPollRunRestartDoesNotAdvanceOnStaleHead(t *testing.T) {
+	shortenPollTimers(t, 20*time.Millisecond, 150*time.Millisecond)
+
+	signing := "1111111123456789abcdef0123456789abcdef01"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(blockJSONAt(100, signing, signing)))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	blocks := make([]int, showBLocks)
+	for i := range blocks {
+		blocks[i] = -1
+	}
+	cc := &ChainConfig{
+		name:           "Gnoland-T",
+		ChainId:        "onyx-1",
+		Type:           "gnoland",
+		gnoRpcEndpoint: srv.URL,
+		Nodes:          []*NodeConfig{{Url: srv.URL}},
+		valInfo:        &ValInfo{Moniker: "MictoNode", Valcons: signing, Bonded: true},
+		blocksResults:  blocks,
+	}
+	cc.lastBlockNum = 100
+	haltedAt := time.Now().Add(-10 * time.Minute)
+	cc.lastBlockTime = haltedAt
+
+	// First run exits on the idle timer, then the run loop reconnects and starts
+	// the poller again. Neither run may treat the frozen head as a new block.
+	cc.PollRun()
+	cc.PollRun()
+
+	if !cc.lastBlockTime.Equal(haltedAt) {
+		t.Fatalf("stale head refreshed lastBlockTime across a poller restart (stalled alarm would never fire): got %s, want %s",
+			cc.lastBlockTime, haltedAt)
+	}
+	if cc.lastBlockNum != 100 {
+		t.Fatalf("lastBlockNum changed on a stale head: %d", cc.lastBlockNum)
+	}
+	if cc.blocksResults[0] != -1 {
+		t.Fatalf("stale head was recorded as a signing result in the grid: %d", cc.blocksResults[0])
+	}
+	if cc.gnoWin == nil || cc.gnoWin.Window() != 0 {
+		t.Fatalf("stale head was pushed into the signing window")
+	}
+}
+
+// TestPollRunAcceptsChainHeightReset: a re-genesis (upgrade with fresh heights)
+// makes the head lower than the last processed height. That must not freeze
+// monitoring — after the idle window the new head is accepted and polling resumes.
+func TestPollRunAcceptsChainHeightReset(t *testing.T) {
+	shortenPollTimers(t, 20*time.Millisecond, 80*time.Millisecond)
+
+	signing := "1111111123456789abcdef0123456789abcdef01"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(blockJSONAt(50, signing, signing)))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	withCtx(t, ctx)
+
+	cc := &ChainConfig{
+		name:           "Gnoland-T",
+		ChainId:        "onyx-1",
+		Type:           "gnoland",
+		gnoRpcEndpoint: srv.URL,
+		Nodes:          []*NodeConfig{{Url: srv.URL}},
+		valInfo:        &ValInfo{Moniker: "MictoNode", Valcons: signing, Bonded: true},
+		blocksResults:  make([]int, showBLocks),
+	}
+	cc.lastBlockNum = 500
+	cc.lastBlockTime = time.Now().Add(-time.Hour)
+
+	done := make(chan struct{})
+	go func() { cc.PollRun(); close(done) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		h := cc.lastBlockNum
+		cc.stateMux.RUnlock()
+		if h == 50 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("lower head after a re-genesis was never accepted, lastBlockNum=%d", h)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if !cc.lastBlockTime.After(time.Now().Add(-time.Minute)) {
+		t.Fatalf("accepted re-genesis head did not refresh lastBlockTime: %s", cc.lastBlockTime)
+	}
+}
+
 // TestPollRunReturnsWhenSigningAddrUnresolved: when the signing address could
 // not be derived (Valcons empty), PollRun must return immediately rather than
 // enter the poll loop where it could never match a precommit.

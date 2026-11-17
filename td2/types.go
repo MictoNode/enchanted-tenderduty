@@ -188,6 +188,51 @@ func (cc *ChainConfig) mkUpdateWithMoniker(t metricType, v float64, node string,
 	}
 }
 
+// statusUpdate builds the chain's dashboard status from its current runtime
+// state. Callers hold cc.stateMux.
+func (cc *ChainConfig) statusUpdate() *dash.ChainStatus {
+	healthy := 0
+	for i := range cc.Nodes {
+		if !cc.Nodes[i].down {
+			healthy++
+		}
+	}
+	cc.activeAlerts = alarms.getCount(cc.name)
+	st := &dash.ChainStatus{
+		MsgType:      "status",
+		Name:         cc.name,
+		ChainId:      cc.ChainId,
+		Network:      cc.Network,
+		Nodes:        len(cc.Nodes),
+		HealthyNodes: healthy,
+		ActiveAlerts: cc.activeAlerts,
+		Height:       cc.lastBlockNum,
+		LastError:    getAlarms(cc.name),
+		Blocks:       append([]int(nil), cc.blocksResults...),
+	}
+	if cc.valInfo != nil {
+		st.Moniker = cc.valInfo.Moniker
+		st.Bonded = cc.valInfo.Bonded
+		st.Jailed = cc.valInfo.Jailed
+		st.Tombstoned = cc.valInfo.Tombstoned
+		st.Missed = cc.valInfo.Missed
+		st.Window = cc.valInfo.Window
+	}
+	return st
+}
+
+// pushStatus sends a dashboard status update. PollRun/WsRun only send updates
+// when a block arrives, so a stalled chain leaves the dashboard frozen on its
+// last pre-halt snapshot (healthy, zero active alerts) even while an alarm is
+// firing. watch() calls this on alarm transitions so the stall and the alert
+// become visible. Callers hold cc.stateMux.
+func (cc *ChainConfig) pushStatus() {
+	if !td.EnableDash {
+		return
+	}
+	td.updateChan <- cc.statusUpdate()
+}
+
 // AlertConfig defines the type of alerts to send for a ChainConfig
 type AlertConfig struct {
 	// How many minutes to wait before alerting that no new blocks have been seen

@@ -641,11 +641,16 @@ func (cc *ChainConfig) watch() {
 			// chain is stalled, send an alert
 			cc.lastBlockAlarm = true
 			td.alert(cc.name, stalledMsg, "critical", false, &cc.valInfo.Valcons)
+			// No blocks are arriving, so PollRun/WsRun send no dashboard updates:
+			// push the stalled state ourselves or the dashboard keeps showing the
+			// last pre-halt snapshot with zero active alerts.
+			cc.pushStatus()
 		case "resolve":
 			// blocks are flowing again (or we never saw one); clear the alarm
 			cc.lastBlockAlarm = false
 			td.alert(cc.name, stalledMsg, "info", true, &cc.valInfo.Valcons)
 			alarms.clearNoBlocks(cc.name)
+			cc.pushStatus()
 		}
 
 		// jailed/inactive detection - only alert on a real transition. The resolve
