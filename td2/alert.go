@@ -660,7 +660,12 @@ func (cc *ChainConfig) watch() {
 		// would re-fire the resolve every 2s tick and spam "no corresponding alert".
 		if cc.lastValInfo != nil && cc.lastValInfo.Moniker == cc.valInfo.Moniker {
 			inactive := "jailed"
-			if cc.valInfo.Tombstoned {
+			switch {
+			case cc.Type == "gnoland":
+				// gno has no jail/slashing module: leaving the active set is the
+				// only way to become inactive.
+				inactive = "not in the active set"
+			case cc.valInfo.Tombstoned:
 				// don't worry about changing it back ... lol.
 				inactive = "☠️ tombstoned 🪦"
 			}
@@ -702,6 +707,11 @@ func (cc *ChainConfig) watch() {
 		}
 
 		// window percentage missed block alarms
+		windowDesc := "slashing window's"
+		if cc.Type == "gnoland" {
+			// gno has no slashing; the window is a local signing-health window.
+			windowDesc = "signing-health window's"
+		}
 		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, pctAlarm, cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
 		case "fire":
 			// alert on missed block counter!
@@ -709,7 +719,7 @@ func (cc *ChainConfig) watch() {
 			id := cc.valInfo.Valcons + "percent"
 			td.alert(
 				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
+				fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
 				cc.Alerts.PercentagePriority,
 				false,
 				&id,
@@ -721,7 +731,7 @@ func (cc *ChainConfig) watch() {
 			id := cc.valInfo.Valcons + "percent"
 			td.alert(
 				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
+				fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
 				"info",
 				true,
 				&id,

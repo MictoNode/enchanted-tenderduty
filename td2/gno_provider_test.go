@@ -2,12 +2,15 @@ package tenderduty
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cosmos/cosmos-sdk/types/bech32"
 )
@@ -662,4 +665,74 @@ func TestGnoGetValInfoAllNodesRealmFailPreservesState(t *testing.T) {
 	if cc.valInfo.Jailed {
 		t.Fatal("realm failure must not mark the validator jailed")
 	}
+}
+
+// TestGnoMonitorHealthFlagsWrongChain: a /status that answers with another
+// network must mark that node down. Otherwise a mixed testnet/mainnet endpoint
+// list would let the poller read head heights (and fetch commits) from the
+// wrong chain.
+func TestGnoMonitorHealthFlagsWrongChain(t *testing.T) {
+	og, od := gnoHealthInterval, gnoHealthRetryDelay
+	gnoHealthInterval, gnoHealthRetryDelay = 20*time.Millisecond, time.Millisecond
+	defer func() { gnoHealthInterval, gnoHealthRetryDelay = og, od }()
+
+	statusFor := func(network string, height int64) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/status" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"result":{"node_info":{"network":%q},"sync_info":{"latest_block_height":"%d","catching_up":false}}}`, network, height)))
+		}
+	}
+	srvWrong := httptest.NewServer(statusFor("other-1", 500))
+	defer srvWrong.Close()
+	srvRight := httptest.NewServer(statusFor("t", 400))
+	defer srvRight.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cc := &ChainConfig{
+		name:    "gno",
+		ChainId: "t",
+		Type:    "gnoland",
+		Nodes: []*NodeConfig{
+			{Url: srvWrong.URL, AlertIfDown: true},
+			{Url: srvRight.URL, AlertIfDown: true},
+		},
+		valInfo:       &ValInfo{Moniker: "x"},
+		blocksResults: make([]int, showBLocks),
+	}
+	done := make(chan struct{})
+	go func() { cc.gnoMonitorHealth(ctx, "gno"); close(done) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		wrongDown := cc.Nodes[0].down
+		rightDown := cc.Nodes[1].down
+		msg := cc.Nodes[0].lastMsg
+		cc.stateMux.RUnlock()
+		if wrongDown {
+			if rightDown {
+				cancel()
+				<-done
+				t.Fatalf("matching node was marked down too: %q", msg)
+			}
+			if !strings.Contains(msg, "chain id other-1 does not match t") {
+				cancel()
+				<-done
+				t.Fatalf("wrong-chain node marked down for the wrong reason: %q", msg)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("wrong-chain node was never marked down")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
 }

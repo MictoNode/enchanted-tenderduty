@@ -33,6 +33,11 @@ var hexAddrRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // than one health tick (~1 min).
 const gnoBondedConfirmTicks = 2
 
+// gnoHealthRetryDelay is how long gnoMonitorHealth waits before retrying a
+// /status check that failed, so one transient error does not mark a node down
+// (and pause PollRun on it) for a whole health tick.
+var gnoHealthRetryDelay = 2 * time.Second
+
 // canonicalAddr decodes a validator address given in hex (40 hex chars) or bech32
 // form into its 20-byte consensus address. gno.land endpoints mix encodings
 // (/validators may be bech32 g1..., /block proposer/precommits are hex), so all
@@ -504,29 +509,66 @@ func (cc *ChainConfig) gnoNewRpc() error {
 	return errors.New("no usable endpoints available for " + cc.ChainId)
 }
 
+// gnoHealthInterval is how often gnoMonitorHealth re-checks node status and
+// refreshes validator info. Var (not const) so tests can shorten it.
+var gnoHealthInterval = time.Minute
+
 // gnoMonitorHealth periodically re-checks each gno node and refreshes valInfo.
 func (cc *ChainConfig) gnoMonitorHealth(ctx context.Context, chainName string) {
-	tick := time.NewTicker(time.Minute)
+	tick := time.NewTicker(gnoHealthInterval)
 	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			cc.stateMux.RLock()
-			rpcEndpoint := cc.gnoRpcEndpoint
-			cc.stateMux.RUnlock()
-			head, _, _, _ := GnoGetStatus(rpcEndpoint)
-			headH, _ := strconv.ParseInt(head, 10, 64)
+			// Lag must be measured against the real head, not the sticky
+			// cc.gnoRpcEndpoint: that endpoint can itself lag (the very failure
+			// mode poll-all exists for) or be unreachable, in which case every
+			// "lag" computed from it came out as zero and node-lag alerting was
+			// silently dead. Take the max height reported by the configured nodes.
+			type gnoNodeStatus struct {
+				node     *NodeConfig
+				height   int64
+				catching bool
+				err      error
+			}
+			statuses := make([]gnoNodeStatus, 0, len(cc.Nodes))
+			var headH int64
 			for _, node := range cc.Nodes {
-				_, nh, catching, err := GnoGetStatus(node.Url)
+				cid, nh, catching, err := GnoGetStatus(node.Url)
+				if err != nil {
+					// One failed /status (timeout, CDN 5xx, rate limit) must not
+					// mark the node down for a whole health tick: PollRun skips
+					// down nodes, so a single-node chain would pause polling for
+					// up to a minute. Retry once before declaring it down.
+					time.Sleep(gnoHealthRetryDelay)
+					cid, nh, catching, err = GnoGetStatus(node.Url)
+				}
+				if err == nil && cid != cc.ChainId {
+					// A healthy endpoint on the wrong network would otherwise be
+					// polled for head heights (and commits) of another chain.
+					err = fmt.Errorf("chain id %s does not match %s", cid, cc.ChainId)
+					nh = ""
+				}
+				st := gnoNodeStatus{node: node, catching: catching, err: err}
+				if err == nil {
+					st.height, _ = strconv.ParseInt(nh, 10, 64)
+					if st.height > headH {
+						headH = st.height
+					}
+				}
+				statuses = append(statuses, st)
+			}
+			for _, st := range statuses {
+				node := st.node
+				catching, err := st.catching, st.err
 				if err != nil {
 					nodeLagCheck(cc, node, 0)
-					alertNodeDown(cc, node, "down")
+					alertNodeDown(cc, node, "down: "+err.Error())
 					continue
 				}
-				h, _ := strconv.ParseInt(nh, 10, 64)
-				nodeLagCheck(cc, node, headH-h)
+				nodeLagCheck(cc, node, headH-st.height)
 				if catching {
 					cc.stateMux.Lock()
 					node.syncing = true

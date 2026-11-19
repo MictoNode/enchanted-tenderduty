@@ -188,6 +188,7 @@ func snapshotStateOf(c *Config) ([]byte, error) {
 			gnoCounters[k] = &gnoSavedStats{
 				TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
 				TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
+				LastBlockNum: v.lastBlockNum, LastBlockTime: v.lastBlockTime,
 			}
 		}
 		v.stateMux.RUnlock()

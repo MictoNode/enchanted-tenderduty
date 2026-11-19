@@ -94,6 +94,12 @@ type gnoSavedStats struct {
 	TotalProps      float64 `json:"total_props"`
 	TotalMiss       float64 `json:"total_miss"`
 	ConsecutiveMiss float64 `json:"consecutive_miss"`
+	// LastBlockNum and LastBlockTime let a restarted process resume where it
+	// stopped. Without them a restart during a chain halt re-evaluates the
+	// frozen head as fresh blocks (refreshing lastBlockTime and masking the
+	// stalled alarm) and every restart re-backfills the catch-up window.
+	LastBlockNum  int64     `json:"last_block_num,omitempty"`
+	LastBlockTime time.Time `json:"last_block_time,omitempty"`
 }
 
 // ChainConfig represents a validator to be monitored on a chain, it is somewhat of a misnomer since multiple
@@ -393,6 +399,9 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		default:
 			problems = append(problems, fmt.Sprintf("warn: %20s has unknown chain type %q (expected cosmos or gnoland)", k, v.Type))
 		}
+		if v.Type == "gnoland" && v.ValAddress == "" {
+			problems = append(problems, fmt.Sprintf("warn: %20s gnoland chain has no valoper_address; the signing address cannot be resolved and block monitoring stays inactive", k))
+		}
 		switch strings.ToLower(v.Network) {
 		case "", "mainnet", "testnet":
 			// ok (empty = appears only in the "all" tab)
@@ -678,9 +687,34 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 			c.Chains[k].statTotalProps = v.TotalProps
 			c.Chains[k].statTotalMiss = v.TotalMiss
 			c.Chains[k].statConsecutiveMiss = v.ConsecutiveMiss
+			c.Chains[k].lastBlockNum = v.LastBlockNum
+			// Resume the stall clock only when the saved time is still fresh
+			// enough to be meaningful. A process that was down longer than the
+			// stall threshold would otherwise fire a false "stalled" critical the
+			// moment monitoring starts, while a chain that is already halted must
+			// still alarm: in that case start the clock now, so the alarm fires
+			// after the configured threshold instead of never (zero time).
+			stalled := c.Chains[k].Alerts.Stalled
+			if stalled <= 0 {
+				stalled = 10
+			}
+			if !v.LastBlockTime.IsZero() && time.Since(v.LastBlockTime) <= time.Duration(stalled)*time.Minute {
+				c.Chains[k].lastBlockTime = v.LastBlockTime
+			} else {
+				c.Chains[k].lastBlockTime = time.Now()
+			}
 			// valInfo.Missed/Window are NOT restored: they come from the ephemeral
 			// gnoWin sliding ring (warm-up after restart), not a persisted counter.
 			l(fmt.Sprintf("📂 restored gno counters for %s", k))
+		}
+	}
+
+	// gno: without a saved timestamp the stall clock (and the prometheus
+	// last-block gauge) would start at the zero time — a chain that is already
+	// halted at first boot would never raise its stalled alarm.
+	for _, v := range c.Chains {
+		if v.Type == "gnoland" && v.lastBlockTime.IsZero() {
+			v.lastBlockTime = time.Now()
 		}
 	}
 

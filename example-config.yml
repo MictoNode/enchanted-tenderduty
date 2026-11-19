@@ -141,12 +141,17 @@ chains:
         alert_if_down: no
 
   # ----- Gnoland example -----
-  # `type: gnoland` selects the gnoland provider: HTTP-polling /block every 5s
-  # (TM2 public nodes have no websocket) + the gno valopers realm.
+  # `type: gnoland` selects the gnoland provider: TM2 public nodes expose no
+  # websocket, so it reads the head from every configured node (/status, every
+  # 5s, max height wins) and evaluates EVERY height in between via
+  # /commit?height=N — block-level accuracy even when blocks are faster than
+  # the poll interval (gno.land mainnet is ~3.5s). A gno restart resumes from
+  # the persisted last height, so a halted chain still raises its stalled alarm.
   # valoper_address is the OPERATOR address shown on gnoweb
   # (gno.land/r/gnops/valopers:<operator>). The signing/consensus address used
-  # by /validators and /block is auto-derived from the realm — do NOT put the
-  # signing address here.
+  # by /validators and /commit is auto-derived from the realm — do NOT put the
+  # signing address here. The operator needs a profile in the valopers realm.
+  # Mainnet: chain_id: gnoland-1, public RPC https://rpc.gno.land.
   # "Gno-Testnet":
   #   chain_id: test11
   #   network: testnet
@@ -156,7 +161,7 @@ chains:
   #   gno_signed_blocks_window: 10000                              # gno has NO on-chain slashing window;
   #                                                                # this LOCAL sliding window (last N
   #                                                                # blocks) drives uptime % + percentage.
-  #                                                                # Default 10000.
+  #                                                                # Default 10000 (~9.7h at 3.5s blocks).
   #   alerts:
   #     stalled_enabled: yes
   #     stalled_minutes: 5

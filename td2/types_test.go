@@ -80,9 +80,10 @@ func TestChainConfigTypeRejectsUnknown(t *testing.T) {
 }
 
 func TestSavedStateGnoCountersRoundTrip(t *testing.T) {
+	lastAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
 	s := savedState{
 		GnoCounters: map[string]*gnoSavedStats{
-			"gno": {TotalSigns: 90, TotalProps: 5, TotalMiss: 7, ConsecutiveMiss: 3},
+			"gno": {TotalSigns: 90, TotalProps: 5, TotalMiss: 7, ConsecutiveMiss: 3, LastBlockNum: 1234, LastBlockTime: lastAt},
 		},
 	}
 	b, err := json.Marshal(&s)
@@ -96,6 +97,9 @@ func TestSavedStateGnoCountersRoundTrip(t *testing.T) {
 	g := back.GnoCounters["gno"]
 	if g == nil || g.TotalSigns != 90 || g.TotalMiss != 7 || g.ConsecutiveMiss != 3 {
 		t.Fatalf("round-trip lost gno counters: %+v", back.GnoCounters)
+	}
+	if g.LastBlockNum != 1234 || !g.LastBlockTime.Equal(lastAt) {
+		t.Fatalf("round-trip lost gno last block state: %+v", g)
 	}
 }
 
@@ -198,5 +202,83 @@ func TestClearStalePagerDutyUsesCaseInsensitiveNotice(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected stale PagerDuty manual-clear notice")
+	}
+}
+
+// TestLoadConfigRestoresGnoLastBlock: a gno restart must resume from the saved
+// height (no re-backfill of the frozen head) and must not fire a false stalled
+// alarm when the process was down longer than the stall threshold — yet an
+// already-halted chain still gets a stall clock that starts at process start.
+func TestLoadConfigRestoresGnoLastBlock(t *testing.T) {
+	oldAlarms, oldLogs := alarms, logs
+	defer func() { alarms, logs = oldAlarms, oldLogs }()
+	logs = make(chan interface{}, 20)
+	alarms = &alarmCache{
+		SentPdAlarms:  make(map[string]time.Time),
+		SentTgAlarms:  make(map[string]time.Time),
+		SentDiAlarms:  make(map[string]time.Time),
+		SentSlkAlarms: make(map[string]time.Time),
+		SentPoAlarms:  make(map[string]time.Time),
+		AllAlarms:     make(map[string]map[string]time.Time),
+	}
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yml")
+	stateFile := filepath.Join(dir, "state.json")
+	chainsDir := filepath.Join(dir, "chains.d")
+	if err := os.Mkdir(chainsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configFile, []byte(`
+chains:
+  fresh:
+    chain_id: gnoland-1
+    type: gnoland
+    valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    alerts:
+      stalled_enabled: true
+      stalled_minutes: 5
+  stale:
+    chain_id: gnoland-1
+    type: gnoland
+    valoper_address: g1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+    alerts:
+      stalled_enabled: true
+      stalled_minutes: 5
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recent := time.Now().Add(-time.Minute).UTC()
+	longDown := time.Now().Add(-48 * time.Hour).UTC()
+	b, err := json.Marshal(&savedState{
+		GnoCounters: map[string]*gnoSavedStats{
+			"fresh": {LastBlockNum: 1234, LastBlockTime: recent},
+			"stale": {LastBlockNum: 99, LastBlockTime: longDown},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	password := ""
+	c, err := loadConfig(configFile, stateFile, chainsDir, &password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Chains["fresh"].lastBlockNum; got != 1234 {
+		t.Fatalf("lastBlockNum not restored: %d", got)
+	}
+	if got := c.Chains["fresh"].lastBlockTime; got.Sub(recent) > time.Second || recent.Sub(got) > time.Second {
+		t.Fatalf("recent lastBlockTime not restored: %s (saved %s)", got, recent)
+	}
+	if got := c.Chains["stale"].lastBlockNum; got != 99 {
+		t.Fatalf("lastBlockNum not restored for stale chain: %d", got)
+	}
+	if got := c.Chains["stale"].lastBlockTime; time.Since(got) > time.Minute {
+		t.Fatalf("long-downtime lastBlockTime must restart the stall clock at process start, got %s", got)
 	}
 }

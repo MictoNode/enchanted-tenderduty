@@ -283,11 +283,12 @@ per-chain overrides, healthcheck, etc.).
 
 ### gnoland notes
 
-- gno.land has **two addresses per validator**: an operator address (the valopers realm key, shown on gnoweb) and a signing/consensus address (used by `/validators` and `/block`). Put the **operator** address in `valoper_address`; the signing address is resolved automatically from the realm.
-- Public gno.land nodes generally **don't support websocket subscriptions**, so the gno provider **HTTP-polls** `/block` every 5s and reconstructs signing status from `last_commit.precommits`.
-- gno has **no on-chain slashing module**, so there is no slashing window to query. The optional `gno_signed_blocks_window` (default 10000) defines a **LOCAL sliding signing-health window** (last N blocks) that drives the dashboard uptime % and the `percentage_missed` alert — it is a health metric, **not** a slashing window. `consecutive_missed` remains the **primary** gno alert.
+- gno.land has **two addresses per validator**: an operator address (the valopers realm key, shown on gnoweb) and a signing/consensus address (used by `/validators` and `/commit`). Put the **operator** address in `valoper_address`; the signing address is resolved automatically from the realm. The operator must have a profile in the valopers realm, otherwise no signing address can be derived and block monitoring stays inactive until the profile exists.
+- Public gno.land nodes generally **don't support websocket subscriptions**, so the gno provider works over HTTP: every 5s it reads the head from **all** configured nodes (`/status`, max height wins) and evaluates **every height in between** via `/commit?height=N`. That keeps block-level accuracy on chains whose block time (~3.5s on gno.land mainnet) is shorter than the poll interval; a large backlog after downtime is bounded (last 100 heights per tick, skipped beyond 1000).
+- gno mainnet is `chain_id: gnoland-1` with public RPC `https://rpc.gno.land` (put at least two endpoints if you have them — head detection and commit fetches both prefer the healthy one and fall back).
+- gno has **no on-chain slashing module**, so there is no slashing window to query. The optional `gno_signed_blocks_window` (default 10000) defines a **LOCAL sliding signing-health window** (last N blocks) that drives the dashboard uptime % and the `percentage_missed` alert — it is a health metric, **not** a slashing window. At ~3.5s blocks 10000 ≈ 9.7 hours; use a smaller value (e.g. 1000 ≈ 1h) if you want the uptime % to react faster. `consecutive_missed` remains the **primary** gno alert.
 - A validator that is resolved but **not in the active set** is not expected to sign, so it neither accrues missed counters nor fires false consecutive alerts; the dashboard shows its blocks as "No Data".
-- Jailed is detected when the validator leaves the active set.
+- Inactive detection: gno has no jail, so the "jailed" alert fires when the validator **leaves the active set** (bonded → unbonded, debounced over two health ticks). Last processed height and block time are persisted, so a restart resumes where it stopped and does not mask a stalled chain.
 
 ---
 
