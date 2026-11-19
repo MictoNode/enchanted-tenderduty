@@ -32,7 +32,7 @@ func TestStalledTransition(t *testing.T) {
 		{"no-op when healthy and no alarm", true, false, recent, ""},
 		{"resolve on zero block time (defensive)", true, true, time.Time{}, "resolve"},
 		{"disabled: no fire", false, false, stale, ""},
-		{"disabled: no resolve", false, true, recent, ""},
+		{"disabled with active alarm resolves", false, true, recent, "resolve"},
 	}
 
 	for _, c := range cases {
@@ -70,7 +70,7 @@ func TestInactiveTransition(t *testing.T) {
 		{"no-op when bonded unchanged (both bonded)", true, true, true, false, ""},
 		{"no-op when never bonded", true, false, false, false, ""},
 		{"disabled: no fire", false, true, false, false, ""},
-		{"disabled: no resolve", false, false, true, true, ""},
+		{"disabled with active alarm resolves", false, false, true, true, "resolve"},
 	}
 
 	for _, c := range cases {
@@ -101,7 +101,7 @@ func TestPercentageMissedTransition(t *testing.T) {
 		{"equal threshold is not over", true, false, 5, 10, 50, ""},
 		{"zero window is ignored", true, false, 1, 0, 50, ""},
 		{"disabled: no fire", false, false, 6, 10, 50, ""},
-		{"disabled: no resolve", false, true, 4, 10, 50, ""},
+		{"disabled with active alarm resolves", false, true, 4, 10, 50, "resolve"},
 	}
 
 	for _, c := range cases {

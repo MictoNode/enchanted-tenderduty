@@ -482,15 +482,21 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 // stalledTransition decides the stalled-chain alarm transition given the last
 // block time and current alarm state. It returns "fire" when the chain has been
 // idle past the threshold and no alarm is active, "resolve" when an active alarm
-// should clear (blocks are flowing again within the threshold, or no block has
-// ever been seen), and "" otherwise. Shared by the cosmos and gnoland providers
-// via watch().
+// should clear (blocks are flowing again within the threshold, no block has ever
+// been seen, or the alert type was disabled), and "" otherwise. Shared by the
+// cosmos and gnoland providers via watch().
 //
 // The recover ("resolve") path is what clears a stalled alarm once blocks resume:
 // without it the alarm lingered in the cache (and survived restart via saved
 // state), keeping the dashboard's alert indicator blinking after a transient stall.
 func stalledTransition(stalledAlerts bool, lastBlockAlarm bool, lastBlockTime time.Time, stalledMin int, now time.Time) string {
 	if !stalledAlerts {
+		// The alert type was disabled while an alarm was active: clear the cached
+		// alarm, otherwise it stays on the dashboard forever (it survived restart
+		// via saved state and nothing can resolve it anymore).
+		if lastBlockAlarm {
+			return "resolve"
+		}
 		return ""
 	}
 	if lastBlockTime.IsZero() {
@@ -521,6 +527,11 @@ func stalledTransition(stalledAlerts bool, lastBlockAlarm bool, lastBlockTime ti
 // when a gno validator was transiently misread as inactive and then recovered.
 func inactiveTransition(alertIfInactive, lastBonded, curBonded, alarmActive bool) string {
 	if !alertIfInactive {
+		// Disabled while an alarm was active: resolve it instead of leaving it
+		// stuck in the cache/dashboard.
+		if alarmActive {
+			return "resolve"
+		}
 		return ""
 	}
 	switch {
@@ -533,15 +544,24 @@ func inactiveTransition(alertIfInactive, lastBonded, curBonded, alarmActive bool
 	}
 }
 
-func percentageMissedTransition(percentageAlerts bool, pctAlarm bool, missed int64, window int64, limit int) string {
-	if !percentageAlerts || window <= 0 {
+func percentageMissedTransition(percentageAlerts bool, alarmActive bool, missed int64, window int64, limit int) string {
+	if !percentageAlerts {
+		// Disabled while an alarm was active: resolve instead of leaving a
+		// phantom alarm (this is what happened after switching gno to
+		// percentage_enabled: no with a cached false alarm).
+		if alarmActive {
+			return "resolve"
+		}
+		return ""
+	}
+	if window <= 0 {
 		return ""
 	}
 	overLimit := 100*float64(missed)/float64(window) > float64(limit)
 	switch {
-	case overLimit && !pctAlarm:
+	case overLimit && !alarmActive:
 		return "fire"
-	case !overLimit && pctAlarm:
+	case !overLimit && alarmActive:
 		return "resolve"
 	default:
 		return ""
@@ -552,7 +572,7 @@ func percentageMissedTransition(percentageAlerts bool, pctAlarm bool, missed int
 // and also updates a few prometheus stats
 // Node-lag detection (node behind head) runs in monitorHealth via nodeLagCheck().
 func (cc *ChainConfig) watch() {
-	var missedAlarm, pctAlarm, noNodes bool
+	var noNodes bool
 	nodeAlarms := make(map[string]bool)
 
 	// wait until we have a moniker:
@@ -679,63 +699,39 @@ func (cc *ChainConfig) watch() {
 			}
 		}
 
-		// consecutive missed block alarms:
-		if !missedAlarm && cc.Alerts.ConsecutiveAlerts && int(cc.statConsecutiveMiss) >= cc.Alerts.ConsecutiveMissed {
-			// alert on missed block counter!
-			missedAlarm = true
+		// consecutive missed block alarms. The decision is driven by the alarm
+		// cache (the persistent source of truth), mirroring stalled/inactive: a
+		// restart keeps a delivering alarm delivering, and disabling the alert
+		// type clears a previously active alarm instead of leaving it stuck.
+		consecMsg := fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId)
+		consecActive := alarms.hasMessage(cc.name, consecMsg)
+		overConsecutive := int(cc.statConsecutiveMiss) >= cc.Alerts.ConsecutiveMissed
+		switch {
+		case !consecActive && cc.Alerts.ConsecutiveAlerts && overConsecutive:
 			id := cc.valInfo.Valcons + "consecutive"
-			td.alert(
-				cc.name,
-				fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
-				cc.Alerts.ConsecutivePriority,
-				false,
-				&id,
-			)
+			td.alert(cc.name, consecMsg, cc.Alerts.ConsecutivePriority, false, &id)
 			cc.activeAlerts = alarms.getCount(cc.name)
-		} else if missedAlarm && int(cc.statConsecutiveMiss) < cc.Alerts.ConsecutiveMissed {
-			// clear the alert
-			missedAlarm = false
+		case consecActive && (!cc.Alerts.ConsecutiveAlerts || !overConsecutive):
 			id := cc.valInfo.Valcons + "consecutive"
-			td.alert(
-				cc.name,
-				fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
-				"info",
-				true,
-				&id,
-			)
+			td.alert(cc.name, consecMsg, "info", true, &id)
 			cc.activeAlerts = alarms.getCount(cc.name)
 		}
 
-		// window percentage missed block alarms
+		// window percentage missed block alarms (same cache-driven pattern).
 		windowDesc := "slashing window's"
 		if cc.Type == "gnoland" {
 			// gno has no slashing; the window is a local signing-health window.
 			windowDesc = "signing-health window's"
 		}
-		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, pctAlarm, cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
+		pctMsg := fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId)
+		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, alarms.hasMessage(cc.name, pctMsg), cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
 		case "fire":
-			// alert on missed block counter!
-			pctAlarm = true
 			id := cc.valInfo.Valcons + "percent"
-			td.alert(
-				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
-				cc.Alerts.PercentagePriority,
-				false,
-				&id,
-			)
+			td.alert(cc.name, pctMsg, cc.Alerts.PercentagePriority, false, &id)
 			cc.activeAlerts = alarms.getCount(cc.name)
 		case "resolve":
-			// clear the alert
-			pctAlarm = false
 			id := cc.valInfo.Valcons + "percent"
-			td.alert(
-				cc.name,
-				fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
-				"info",
-				true,
-				&id,
-			)
+			td.alert(cc.name, pctMsg, "info", true, &id)
 			cc.activeAlerts = alarms.getCount(cc.name)
 		}
 
