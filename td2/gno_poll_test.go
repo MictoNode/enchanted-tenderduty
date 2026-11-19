@@ -180,7 +180,7 @@ func TestPollRunAcceptsChainHeightReset(t *testing.T) {
 		cc.stateMux.RLock()
 		h := cc.lastBlockNum
 		cc.stateMux.RUnlock()
-		if h == 50 {
+		if h == 49 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -236,7 +236,7 @@ func TestPollRunCountsSignedBySigningAddress(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	withCtx(t, ctx)
 
-	cc := newGnoTestChain("gno", "t", srv.URL, signing, true, 99)
+	cc := newGnoTestChain("gno", "t", srv.URL, signing, true, 98)
 	cc.ValAddress = operator // operator != signing
 	done := make(chan struct{})
 	go func() { cc.PollRun(); close(done) }()
@@ -282,7 +282,7 @@ func TestPollRunSkipsCountersWhenNotBonded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	withCtx(t, ctx)
 
-	cc := newGnoTestChain("gno", "t", srv.URL, signing, false, 99) // resolved but not active
+	cc := newGnoTestChain("gno", "t", srv.URL, signing, false, 98) // resolved but not active
 	done := make(chan struct{})
 	go func() { cc.PollRun(); close(done) }()
 	time.Sleep(150 * time.Millisecond)
@@ -408,7 +408,7 @@ func TestPollRunUsesCommitForHeightNotBlockLastCommit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/status":
-			_, _ = w.Write([]byte(gnoStatusJSON(100)))
+			_, _ = w.Write([]byte(gnoStatusJSON(101))) // head 101 => height 100 is final
 		case "/commit":
 			_, _ = w.Write([]byte(gnoCommitJSON(100, someoneElse, someoneElse))) // we did not sign
 		case "/block":
@@ -460,14 +460,14 @@ func TestPollRunFallsBackToSecondNodeForCommit(t *testing.T) {
 	srvBrokenCommit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/status":
-			_, _ = w.Write([]byte(gnoStatusJSON(100)))
+			_, _ = w.Write([]byte(gnoStatusJSON(101)))
 		default:
 			http.Error(w, "commit disabled", http.StatusNotFound)
 		}
 	}))
 	defer srvBrokenCommit.Close()
 	srvGood := httptest.NewServer(gnoNodeHandler(
-		func() int64 { return 100 },
+		func() int64 { return 101 },
 		func(int64) (string, string) { return someoneElse, signing },
 	))
 	defer srvGood.Close()
@@ -521,7 +521,7 @@ func TestPollRunIgnoresWrongChainNode(t *testing.T) {
 	}))
 	defer srvWrong.Close()
 	srvRight := httptest.NewServer(gnoNodeHandler(
-		func() int64 { return 100 },
+		func() int64 { return 101 },
 		func(int64) (string, string) { return someoneElse, signing },
 	))
 	defer srvRight.Close()
@@ -556,4 +556,55 @@ func TestPollRunIgnoresWrongChainNode(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// TestPollRunDoesNotEvaluateUnfinalizedHead: on onyx-1 (2026-11-19) a node's
+// /commit?height=head returned an in-progress precommit set (dozens of nulls)
+// that briefly lacked validators which DID sign. Counting those nulls as misses
+// raised false "missed block" lines and percentage-alarm churn; the same heights
+// evaluate as signed once final. Only heights at least one block behind the head
+// (final commits) may be evaluated, and an unfinalized head must never appear as
+// a missed block.
+func TestPollRunDoesNotEvaluateUnfinalizedHead(t *testing.T) {
+	shortenPollTimers(t, 20*time.Millisecond, time.Minute)
+
+	signing := "1111111123456789abcdef0123456789abcdef01"
+	someoneElse := "9999999999999999999999999999999999999999"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			_, _ = w.Write([]byte(gnoStatusJSON(100)))
+		case "/commit":
+			h, _ := strconv.ParseInt(r.URL.Query().Get("height"), 10, 64)
+			if h == 100 {
+				// Unfinalized head: the precommit set does not contain us yet.
+				_, _ = w.Write([]byte(gnoCommitJSON(100, someoneElse, someoneElse)))
+				return
+			}
+			_, _ = w.Write([]byte(gnoCommitJSON(h, someoneElse, signing)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	withCtx(t, ctx)
+
+	cc := newGnoTestChain("gno", "t", srv.URL, signing, true, 98)
+	done := make(chan struct{})
+	go func() { cc.PollRun(); close(done) }()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	if cc.lastBlockNum != 99 {
+		t.Fatalf("evaluated past the final head: lastBlockNum=%d, want 99", cc.lastBlockNum)
+	}
+	if cc.statTotalMiss != 0 {
+		t.Fatalf("unfinalized head commit was counted as a miss: miss=%v", cc.statTotalMiss)
+	}
+	if cc.statTotalSigns != 1 {
+		t.Fatalf("final height 99 not counted as signed: signs=%v", cc.statTotalSigns)
+	}
 }

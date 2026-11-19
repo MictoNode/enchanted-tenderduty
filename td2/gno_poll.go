@@ -186,13 +186,18 @@ func (cc *ChainConfig) PollRun() {
 					bestHeight, bestURL = h, nodeURL
 				}
 			}
-			if bestHeight <= lastHeight {
-				// No node produced an advance this tick, so this head is stale and
-				// must not be processed as a new block (that would refresh
-				// lastBlockTime and suppress the stalled alarm). A head that stays
-				// BELOW the last processed height for the whole idle window is a
-				// re-genesis (heights reset), not staleness: accept it so monitoring
-				// recovers without a process restart.
+			// A commit is only final once the NEXT block exists: /commit?height=head
+			// returns an in-progress precommit set (dozens of nulls) that briefly
+			// lacks validators that did sign. Treating those nulls as misses raised
+			// false "missed block" lines and percentage-alarm churn on onyx-1
+			// (2026-11-19; the same heights evaluate as signed once final).
+			finalHead := bestHeight - 1
+			if finalHead <= lastHeight {
+				// Nothing new is finalized this tick, so the head is stale for
+				// evaluation and must not refresh lastBlockTime (that would suppress
+				// the stalled alarm). A head that stays BELOW the last processed
+				// height for the whole idle window is a re-genesis (heights reset),
+				// not staleness: accept it so monitoring recovers without a restart.
 				if bestHeight > 0 && bestHeight < lastHeight &&
 					time.Since(noBlockSince) > gnoPollIdleExit {
 					l(fmt.Sprintf("♻️ %-12s chain height reset to %d (was %d), resuming", cc.ChainId, bestHeight, lastHeight))
@@ -211,22 +216,22 @@ func (cc *ChainConfig) PollRun() {
 			}
 			noBlockSince = time.Now()
 
-			// Evaluate every height the head advanced by, not just the head, so
-			// no block goes uncounted when block time is shorter than the poll
+			// Evaluate every finalized height the head advanced by, not just one,
+			// so no block goes uncounted when block time is shorter than the poll
 			// interval (~3.5s vs 5s on gno.land). Backfill is bounded per tick;
 			// a very large backlog (long outage) is skipped rather than replayed.
 			start := lastHeight + 1
-			if bestHeight-lastHeight > gnoCatchUpJump {
-				skipped := bestHeight - lastHeight - gnoMaxCatchUpBlocks
-				start = bestHeight - gnoMaxCatchUpBlocks + 1
+			if finalHead-lastHeight > gnoCatchUpJump {
+				skipped := finalHead - lastHeight - gnoMaxCatchUpBlocks
+				start = finalHead - gnoMaxCatchUpBlocks + 1
 				// A fresh start (no persisted height) intentionally begins at the
 				// recent history instead of replaying the chain from genesis — only
 				// log the skip when resuming from a known height.
 				if lastHeight > 0 {
-					l(fmt.Sprintf("⏩ %-12s %d heights behind, skipping %d unprocessed heights", cc.ChainId, bestHeight-lastHeight, skipped))
+					l(fmt.Sprintf("⏩ %-12s %d heights behind, skipping %d unprocessed heights", cc.ChainId, finalHead-lastHeight, skipped))
 				}
 			}
-			end := bestHeight
+			end := finalHead
 			if end-start+1 > gnoMaxCatchUpBlocks {
 				end = start + gnoMaxCatchUpBlocks - 1
 			}
