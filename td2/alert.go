@@ -571,6 +571,68 @@ func percentageMissedTransition(percentageAlerts bool, alarmActive bool, missed 
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
 // Node-lag detection (node behind head) runs in monitorHealth via nodeLagCheck().
+// currentAlarmMessages holds the exact cache keys the current config/state
+// would produce for each threshold-bearing alarm type.
+type currentAlarmMessages struct {
+	stalled     string
+	consecutive string
+	percentage  string
+}
+
+// obsolete reports whether msg is a cached alarm of a known configurable type
+// that the current configuration no longer produces: the alert type is
+// disabled, or the message embeds a threshold/moniker/wording that changed.
+// Alarm types not covered here (node-down, no-RPC-endpoints) are left alone.
+func (cur currentAlarmMessages) obsolete(msg string, a AlertConfig) bool {
+	switch {
+	case strings.HasPrefix(msg, "stalled: have not seen a new block on "):
+		return !a.StalledAlerts || msg != cur.stalled
+	case strings.Contains(msg, " is no longer active: validator is "):
+		return !a.AlertIfInactive
+	case strings.Contains(msg, " has missed > "):
+		return !a.PercentageAlerts || msg != cur.percentage
+	case strings.Contains(msg, " has missed "):
+		return !a.ConsecutiveAlerts || msg != cur.consecutive
+	}
+	return false
+}
+
+// clearObsoleteAlarms resolves cached alarms that obsolete() flags. Called once
+// when watch() starts: without it a disabled alert type (or a changed threshold)
+// leaves a phantom alarm in the cache and on the dashboard forever, because the
+// cache is keyed by the generated message text.
+func (cc *ChainConfig) clearObsoleteAlarms() {
+	cc.stateMux.RLock()
+	moniker := ""
+	if cc.valInfo != nil {
+		moniker = cc.valInfo.Moniker
+	}
+	cc.stateMux.RUnlock()
+	if moniker == "" || moniker == "not connected" {
+		return
+	}
+	windowDesc := "slashing window's"
+	if cc.Type == "gnoland" {
+		windowDesc = "signing-health window's"
+	}
+	cur := currentAlarmMessages{
+		stalled:     fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
+		consecutive: fmt.Sprintf("%s has missed %d blocks on %s", moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
+		percentage:  fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
+	}
+	alarms.notifyMux.RLock()
+	msgs := make([]string, 0, len(alarms.AllAlarms[cc.name]))
+	for m := range alarms.AllAlarms[cc.name] {
+		msgs = append(msgs, m)
+	}
+	alarms.notifyMux.RUnlock()
+	for _, m := range msgs {
+		if cur.obsolete(m, cc.Alerts) {
+			td.alert(cc.name, m, "info", true, nil)
+		}
+	}
+}
+
 func (cc *ChainConfig) watch() {
 	var noNodes bool
 	nodeAlarms := make(map[string]bool)
@@ -604,6 +666,13 @@ func (cc *ChainConfig) watch() {
 		noNodesSec = 0
 		break
 	}
+	// Clear cached alarms the current config can no longer produce (alert type
+	// disabled or a threshold/moniker it embeds changed). The cache key IS the
+	// message text, so such an entry would otherwise never resolve and would
+	// stay on the dashboard forever — e.g. percentage disabled + percentage_missed
+	// omitted kept a state-restored false "missed > 10%" alarm active
+	// (prod 2026-11-19).
+	cc.clearObsoleteAlarms()
 	// initial stat creation for nodes, we only update again if the node is positive
 	if td.Prom {
 		for _, node := range cc.Nodes {

@@ -1,6 +1,7 @@
 package tenderduty
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -130,5 +131,62 @@ func TestAlarmCacheHasMessage(t *testing.T) {
 	}
 	if a.hasMessage(chain, "other") {
 		t.Fatal("hasMessage true for an unset message")
+	}
+}
+
+// TestObsoleteAlarmMessage: the alarm cache is keyed by message text, so an
+// alarm whose type was disabled or whose embedded threshold/moniker changed can
+// never be resolved by the normal transition logic. clearObsoleteAlarms uses
+// this classification at watch() start; without it a state-restored false
+// percentage alarm stayed on the dashboard forever (prod 2026-11-19).
+func TestObsoleteAlarmMessage(t *testing.T) {
+	const moniker, chainID = "M", "c"
+	on := AlertConfig{StalledAlerts: true, AlertIfInactive: true, ConsecutiveAlerts: true, PercentageAlerts: true, Stalled: 3, ConsecutiveMissed: 10, Window: 10}
+	off := AlertConfig{Stalled: 3, ConsecutiveMissed: 10, Window: 10} // every alert type disabled
+	disabledPct := on
+	disabledPct.PercentageAlerts = false
+	disabledPct.Window = 0 // percentage_missed omitted, like the prod config
+	stalled5 := on
+	stalled5.Stalled = 5
+	consec5 := on
+	consec5.ConsecutiveMissed = 5
+	pct5 := on
+	pct5.Window = 5
+
+	msgs := func(a AlertConfig) currentAlarmMessages {
+		return currentAlarmMessages{
+			stalled:     fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", chainID, a.Stalled),
+			consecutive: fmt.Sprintf("%s has missed %d blocks on %s", moniker, a.ConsecutiveMissed, chainID),
+			percentage:  fmt.Sprintf("%s has missed > %d%% of the signing-health window's blocks on %s", moniker, a.Window, chainID),
+		}
+	}
+	base := msgs(on)
+
+	cases := []struct {
+		name string
+		msg  string
+		a    AlertConfig
+		want bool
+	}{
+		{"stalled exactly current", base.stalled, on, false},
+		{"stalled disabled", base.stalled, off, true},
+		{"stalled minutes changed", base.stalled, stalled5, true},
+		{"consecutive exactly current", base.consecutive, on, false},
+		{"consecutive disabled", base.consecutive, off, true},
+		{"consecutive threshold changed", base.consecutive, consec5, true},
+		{"percentage exactly current", base.percentage, on, false},
+		{"percentage disabled, old threshold cached", base.percentage, disabledPct, true},
+		{"percentage threshold changed", base.percentage, pct5, true},
+		{"inactive disabled", "M is no longer active: validator is jailed", off, true},
+		{"inactive enabled", "M is no longer active: validator is jailed", on, false},
+		{"node down untouched", "Severity: critical\nRPC node https://x has been down for > 3 minutes on c", off, false},
+		{"no servers untouched", "no RPC endpoints are working for c", off, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := msgs(c.a).obsolete(c.msg, c.a); got != c.want {
+				t.Fatalf("obsolete(%q) = %v, want %v", c.msg, got, c.want)
+			}
+		})
 	}
 }
