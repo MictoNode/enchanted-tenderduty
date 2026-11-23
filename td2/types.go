@@ -487,6 +487,15 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			if v.espressoWin == nil {
 				v.espressoWin = newGnoWindow(v.EspressoDutyWindow)
 			}
+			// loadConfig restores the persisted duty window before validateConfig
+			// runs, but validateConfig resets valInfo to "not connected". Publish
+			// the restored window counts again, otherwise the dashboard shows
+			// "N/A" and the percentage alarm has a 0 denominator until the next
+			// duty arrives (prod observation: duties=32 restored, window 0).
+			if v.valInfo != nil {
+				v.valInfo.Missed = int64(v.espressoWin.Missed())
+				v.valInfo.Window = int64(v.espressoWin.Window())
+			}
 			if v.EspressoNodeURL == "" {
 				problems = append(problems, fmt.Sprintf("warn: %20s espresso chain has no espresso_node_url; leader duties (missed proposals) cannot be tracked, only chain liveness", k))
 			} else {

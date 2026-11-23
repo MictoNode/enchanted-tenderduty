@@ -584,3 +584,24 @@ func TestEspressoStatusIncludesEpochTally(t *testing.T) {
 		t.Fatalf("non-espresso chain reported an epoch: %+v", st)
 	}
 }
+
+// TestValidateConfigPublishesRestoredDutyWindow: loadConfig restores the duty
+// window before validateConfig resets valInfo; the window counts must be
+// published again or the dashboard shows "N/A" until the next duty (prod
+// observation: restored duties=32 but /state window=0).
+func TestValidateConfigPublishesRestoredDutyWindow(t *testing.T) {
+	cc := newEspressoTestChain("http://127.0.0.1:1")
+	cc.espressoWin = newGnoWindow(10)
+	cc.espressoWin.Push(true)
+	cc.espressoWin.Push(false)
+	cc.espressoWin.Push(false)
+	cc.valInfo = &ValInfo{Moniker: "not connected"}
+
+	c := &Config{Chains: map[string]*ChainConfig{"Espresso-M": cc}}
+	if fatal, problems := validateConfig(c); fatal {
+		t.Fatalf("validateConfig fatal: %v", problems)
+	}
+	if cc.valInfo.Window != 3 || cc.valInfo.Missed != 1 {
+		t.Fatalf("restored window not published: missed=%d window=%d, want 1/3", cc.valInfo.Missed, cc.valInfo.Window)
+	}
+}
