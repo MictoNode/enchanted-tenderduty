@@ -94,10 +94,11 @@ func (cc *ChainConfig) EspressoPollRun() {
 			}
 
 			var (
-				logMsgs  []string
-				cells    []int
-				advanced bool
-				events   int
+				logMsgs   []string
+				cells     []int
+				missCells []int
+				advanced  bool
+				events    int
 			)
 
 			cc.stateMux.Lock()
@@ -170,22 +171,16 @@ func (cc *ChainConfig) EspressoPollRun() {
 						cc.valInfo.Missed = int64(cc.espressoWin.Missed())
 						cc.valInfo.Window = int64(cc.espressoWin.Window())
 
-						// Grid cells: exact while the tick saw few duties, sampled
-						// proportionally after a long outage so 500 missed duties
-						// do not flood the 512-cell ring with one poll.
-						gridTotal := dAssigned
-						if gridTotal > 32 {
-							gridTotal = 32
-						}
+						// Grid cells for missed duties. Decided blocks are added
+						// separately below, so the grid keeps flowing at block rate
+						// (a 0.5% stake share only gets a leader duty every ~90s) and
+						// a missed duty stands out as an orange cell in that stream.
 						gridMissed := dMissed
-						if gridMissed > gridTotal {
-							gridMissed = gridTotal
+						if gridMissed > 32 {
+							gridMissed = 32
 						}
 						for i := int64(0); i < gridMissed; i++ {
-							cells = append(cells, int(Statusmissed))
-						}
-						for i := int64(0); i < gridTotal-gridMissed; i++ {
-							cells = append(cells, int(StatusProposed))
+							missCells = append(missCells, int(Statusmissed))
 						}
 
 						if dMissed > 0 && cc.valInfo.Bonded {
@@ -194,6 +189,13 @@ func (cc *ChainConfig) EspressoPollRun() {
 								cc.espressoEpochAssigned-cc.espressoEpochMissed, cc.espressoEpochAssigned)
 							cc.lastError = time.Now().UTC().String() + " " + warn
 							logMsgs = append(logMsgs, warn)
+						} else if successes > 0 && cc.valInfo.Bonded {
+							// Low-stake validators get a duty only every ~1-2 minutes;
+							// one line per duty makes the poller's progress visible in
+							// the journal (the dashboard grid alone moves too slowly).
+							logMsgs = append(logMsgs, fmt.Sprintf("✅ %s proposed leader duty on %s (epoch %d, proposals %d/%d)",
+								cc.valInfo.Moniker, cc.ChainId, cc.espressoEpoch,
+								cc.espressoEpochAssigned-cc.espressoEpochMissed, cc.espressoEpochAssigned))
 						}
 					}
 				}
@@ -212,6 +214,25 @@ func (cc *ChainConfig) EspressoPollRun() {
 			// like the gno poller: a stale head must never refresh lastBlockTime.
 			switch {
 			case head > cc.lastBlockNum:
+				// Every decided block gets a cell, so the grid moves at block rate
+				// like the cosmos/gno grids. The very first sample only seeds the
+				// height: backfilling from 0 would paint a wall of cells for blocks
+				// that were never observed by this process.
+				if cc.lastBlockNum > 0 {
+					blockCell := int(StatusSigned)
+					if !duties {
+						// No node API: our participation is unknown, so do not paint
+						// the new blocks as signed by us.
+						blockCell = -1
+					}
+					delta := head - cc.lastBlockNum
+					if delta > int64(showBLocks) {
+						delta = int64(showBLocks)
+					}
+					for i := int64(0); i < delta; i++ {
+						cells = append(cells, blockCell)
+					}
+				}
 				cc.lastBlockNum = head
 				advanced = true
 				cc.lastBlockTime = time.Now()
@@ -223,6 +244,9 @@ func (cc *ChainConfig) EspressoPollRun() {
 				cc.lastBlockAlarm = false
 				logMsgs = append(logMsgs, fmt.Sprintf("♻️ %-12s chain height reset to %d, resuming", cc.ChainId, head))
 			}
+			// Missed duties are prepended last so they land in front of the block
+			// cells from the same tick and stay visible for a full grid cycle.
+			cells = append(cells, missCells...)
 			for _, c := range cells {
 				cc.espressoPushGrid(c)
 			}

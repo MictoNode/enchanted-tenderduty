@@ -263,13 +263,23 @@ func (cc *ChainConfig) statusUpdate() *dash.ChainStatus {
 			healthy++
 		}
 	}
+	nodeCount := len(cc.Nodes)
+	// The espresso validator's own Status API is monitored as well (node down /
+	// lag alarms), so count it in the dashboard's node row; otherwise 1/1 would
+	// look healthy while the validator endpoint is unreachable.
+	if cc.Type == "espresso" && cc.espressoNode != nil {
+		nodeCount++
+		if !cc.espressoNode.down {
+			healthy++
+		}
+	}
 	cc.activeAlerts = alarms.getCount(cc.name)
 	st := &dash.ChainStatus{
 		MsgType:      "status",
 		Name:         cc.name,
 		ChainId:      cc.ChainId,
 		Network:      cc.Network,
-		Nodes:        len(cc.Nodes),
+		Nodes:        nodeCount,
 		HealthyNodes: healthy,
 		ActiveAlerts: cc.activeAlerts,
 		Height:       cc.lastBlockNum,

@@ -192,6 +192,9 @@ func TestEspressoPollRecordsDutyOutcomes(t *testing.T) {
 		}
 	}
 
+	// Start from a known height so the first tick does not prime the grid.
+	cc.lastBlockNum = 500
+
 	// Wait for the first (baseline) sample before changing the counters: the
 	// poller may start after the test's set() call, and a baseline of 12 would
 	// swallow the first delta.
@@ -222,8 +225,10 @@ func TestEspressoPollRecordsDutyOutcomes(t *testing.T) {
 	if cc.valInfo == nil || cc.valInfo.Missed != 4 || cc.valInfo.Window != 5 {
 		t.Fatalf("duty window: %+v, want missed=4 window=5", cc.valInfo)
 	}
-	// Grid is newest-first: [missed, missed, missed, proposed, missed].
-	want := []int{int(Statusmissed), int(Statusmissed), int(Statusmissed), int(StatusProposed), int(Statusmissed)}
+	// Grid is newest-first and per BLOCK, with one cell per missed duty inserted
+	// in front of that tick's block cells: tick2 pushed [signed, missed], tick3
+	// (lower head, no new blocks) pushed three missed cells.
+	want := []int{int(Statusmissed), int(Statusmissed), int(Statusmissed), int(Statusmissed), int(StatusSigned)}
 	for i, w := range want {
 		if cc.blocksResults[i] != w {
 			t.Fatalf("grid[%d]=%d, want %d (grid=%v)", i, cc.blocksResults[i], w, cc.blocksResults[:6])
@@ -253,6 +258,7 @@ func TestEspressoPollRebaselinesOnCounterReset(t *testing.T) {
 	withCtx(t, ctx)
 
 	cc := newEspressoTestChain(srv.URL)
+	cc.lastBlockNum = 700
 	done := make(chan struct{})
 	go func() { cc.EspressoPollRun(); close(done) }()
 
@@ -295,6 +301,11 @@ func TestEspressoPollRebaselinesOnCounterReset(t *testing.T) {
 	if cc.lastBlockNum != 701 {
 		t.Fatalf("lastBlockNum: %d, want 701", cc.lastBlockNum)
 	}
+	// The height advance is still recorded as a signed block cell; only duty
+	// accounting must stay untouched.
+	if cc.valInfo.Window != 0 || cc.blocksResults[0] != int(StatusSigned) {
+		t.Fatalf("grid after reset: window=%d blocks[0]=%d, want 0/signed", cc.valInfo.Window, cc.blocksResults[0])
+	}
 }
 
 // TestEspressoPollChainOnlyWithoutNodeURL: without the node Status API the
@@ -330,11 +341,33 @@ func TestEspressoPollChainOnlyWithoutNodeURL(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// The first sample only seeds the height; the next advance must paint
+	// "No Data" (-1) cells, not green ones: without the node API our
+	// participation is unknown.
+	m.set(0, 0, 901)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		h := cc.lastBlockNum
+		cc.stateMux.RUnlock()
+		if h == 901 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("chain-only mode never advanced past the primed height: %d", h)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	<-done
 
 	cc.stateMux.RLock()
 	defer cc.stateMux.RUnlock()
+	if cc.blocksResults[0] != -1 {
+		t.Fatalf("chain-only grid cell: %d, want -1 (No Data)", cc.blocksResults[0])
+	}
 	if cc.valInfo.Window != 0 {
 		t.Fatalf("chain-only mode pushed duties: %d", cc.valInfo.Window)
 	}
