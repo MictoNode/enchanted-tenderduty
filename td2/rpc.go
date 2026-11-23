@@ -20,6 +20,9 @@ func (cc *ChainConfig) newRpc() error {
 	if cc.Type == "gnoland" {
 		return cc.gnoNewRpc()
 	}
+	if cc.Type == "espresso" {
+		return cc.espressoNewRpc()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var anyWorking bool // if healthchecks are running, we will skip to the first known good node.
@@ -154,6 +157,10 @@ func nodeLagCheck(cc *ChainConfig, node *NodeConfig, lag int64) {
 func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 	if cc.Type == "gnoland" {
 		cc.gnoMonitorHealth(ctx, chainName)
+		return
+	}
+	if cc.Type == "espresso" {
+		cc.espressoMonitorHealth(ctx, chainName)
 		return
 	}
 	tick := time.NewTicker(time.Minute)

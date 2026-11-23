@@ -612,12 +612,17 @@ func (cc *ChainConfig) clearObsoleteAlarms() {
 		return
 	}
 	windowDesc := "slashing window's"
-	if cc.Type == "gnoland" {
+	consecWhat := "blocks"
+	switch cc.Type {
+	case "gnoland":
 		windowDesc = "signing-health window's"
+	case "espresso":
+		windowDesc = "leader-duty window's"
+		consecWhat = "leader duties"
 	}
 	cur := currentAlarmMessages{
 		stalled:     fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
-		consecutive: fmt.Sprintf("%s has missed %d blocks on %s", moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
+		consecutive: fmt.Sprintf("%s has missed %d %s on %s", moniker, cc.Alerts.ConsecutiveMissed, consecWhat, cc.ChainId),
 		percentage:  fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
 	}
 	alarms.notifyMux.RLock()
@@ -750,9 +755,9 @@ func (cc *ChainConfig) watch() {
 		if cc.lastValInfo != nil && cc.lastValInfo.Moniker == cc.valInfo.Moniker {
 			inactive := "jailed"
 			switch {
-			case cc.Type == "gnoland":
-				// gno has no jail/slashing module: leaving the active set is the
-				// only way to become inactive.
+			case cc.Type == "gnoland", cc.Type == "espresso":
+				// Neither gno.land nor Espresso has a jail/slashing module:
+				// leaving the active set is the only way to become inactive.
 				inactive = "not in the active set"
 			case cc.valInfo.Tombstoned:
 				// don't worry about changing it back ... lol.
@@ -772,7 +777,14 @@ func (cc *ChainConfig) watch() {
 		// cache (the persistent source of truth), mirroring stalled/inactive: a
 		// restart keeps a delivering alarm delivering, and disabling the alert
 		// type clears a previously active alarm instead of leaving it stuck.
-		consecMsg := fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId)
+		consecWhat := "blocks"
+		if cc.Type == "espresso" {
+			// One "block" for an Espresso validator is a leader duty: a view it
+			// was assigned to propose. Participation rates are epoch-level, so
+			// this counter is the only real-time miss signal.
+			consecWhat = "leader duties"
+		}
+		consecMsg := fmt.Sprintf("%s has missed %d %s on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, consecWhat, cc.ChainId)
 		consecActive := alarms.hasMessage(cc.name, consecMsg)
 		overConsecutive := int(cc.statConsecutiveMiss) >= cc.Alerts.ConsecutiveMissed
 		switch {
@@ -788,9 +800,13 @@ func (cc *ChainConfig) watch() {
 
 		// window percentage missed block alarms (same cache-driven pattern).
 		windowDesc := "slashing window's"
-		if cc.Type == "gnoland" {
+		switch cc.Type {
+		case "gnoland":
 			// gno has no slashing; the window is a local signing-health window.
 			windowDesc = "signing-health window's"
+		case "espresso":
+			// Espresso has no slashing either; the window counts leader duties.
+			windowDesc = "leader-duty window's"
 		}
 		pctMsg := fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId)
 		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, alarms.hasMessage(cc.name, pctMsg), cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
@@ -802,6 +818,47 @@ func (cc *ChainConfig) watch() {
 			id := cc.valInfo.Valcons + "percent"
 			td.alert(cc.name, pctMsg, "info", true, &id)
 			cc.activeAlerts = alarms.getCount(cc.name)
+		}
+
+		// Espresso-specific alarms: validator node unreachable and "not voting".
+		// Both are cache-driven (AllAlarms presence) like every other alarm, so a
+		// restart keeps a delivering alarm delivering and a recovered condition
+		// clears the entry instead of leaving a phantom on the dashboard.
+		if cc.Type == "espresso" {
+			if cc.espressoNode != nil {
+				nodeMsg := fmt.Sprintf("validator node %s is not responding on %s", cc.espressoNode.Url, cc.ChainId)
+				downLong := cc.espressoNode.down && !cc.espressoNode.downSince.IsZero() &&
+					time.Since(cc.espressoNode.downSince) > time.Duration(td.NodeDownMin)*time.Minute
+				nodeID := cc.espressoNode.Url + "espresso-node"
+				switch {
+				case !alarms.hasMessage(cc.name, nodeMsg) && downLong:
+					td.alert(cc.name, nodeMsg, td.NodeDownSeverity, false, &nodeID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				case alarms.hasMessage(cc.name, nodeMsg) && !cc.espressoNode.down:
+					td.alert(cc.name, nodeMsg, "info", true, &nodeID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				}
+			}
+			// "not voting": last_voted_view trails current_view. A node that lost
+			// consensus connectivity still serves metrics, so only this lag shows
+			// that the chain is healthy but this validator is not participating.
+			// (The epoch participation endpoint is ~epoch-granular; useless here.)
+			thr := int64(cc.EspressoVoteLagViews)
+			if thr <= 0 {
+				thr = espressoDefaultVoteLag
+			}
+			if cc.espressoCountersValid && cc.valInfo != nil {
+				voteMsg := fmt.Sprintf("%s has not voted on %s in %d views", cc.valInfo.Moniker, cc.ChainId, thr)
+				voteID := cc.valInfo.Valcons + "votelag"
+				switch {
+				case !alarms.hasMessage(cc.name, voteMsg) && cc.espressoVoteLag >= thr:
+					td.alert(cc.name, voteMsg, "warning", false, &voteID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				case alarms.hasMessage(cc.name, voteMsg) && cc.espressoVoteLag < thr:
+					td.alert(cc.name, voteMsg, "info", true, &voteID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				}
+			}
 		}
 
 		// node down alarms

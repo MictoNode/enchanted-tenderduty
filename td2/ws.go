@@ -74,6 +74,10 @@ func (cc *ChainConfig) WsRun() {
 		cc.PollRun()
 		return
 	}
+	if cc.Type == "espresso" {
+		cc.EspressoPollRun()
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var err error

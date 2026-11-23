@@ -80,10 +80,38 @@ type Config struct {
 // savedState is dumped to a JSON file at exit time, and is loaded at start. If successful it will prevent
 // duplicate alerts, and will show old blocks in the dashboard.
 type savedState struct {
-	Alarms      *alarmCache                     `json:"alarms"`
-	Blocks      map[string][]int                `json:"blocks"`
-	NodesDown   map[string]map[string]time.Time `json:"nodes_down"`
-	GnoCounters map[string]*gnoSavedStats       `json:"gno_counters,omitempty"`
+	Alarms           *alarmCache                     `json:"alarms"`
+	Blocks           map[string][]int                `json:"blocks"`
+	NodesDown        map[string]map[string]time.Time `json:"nodes_down"`
+	GnoCounters      map[string]*gnoSavedStats       `json:"gno_counters,omitempty"`
+	EspressoCounters map[string]*espressoSavedStats  `json:"espresso_counters,omitempty"`
+}
+
+// espressoSavedStats persists the espresso provider across restart. The two
+// node counters (Assigned/Missed) are process-lifetime on the node, so they are
+// re-baselined after a node restart; the persisted copies only exist so a
+// tenderduty restart resumes with the last observed values instead of
+// treating every historic duty as new. Duties is the sliding window itself
+// (exact counts, so percentage_missed stays meaningful right after a restart
+// instead of warming up for hours at a small stake share).
+type espressoSavedStats struct {
+	TotalSigns      float64 `json:"total_signs"`
+	TotalProps      float64 `json:"total_props"`
+	TotalMiss       float64 `json:"total_miss"`
+	ConsecutiveMiss float64 `json:"consecutive_miss"`
+
+	CountersValid bool  `json:"counters_valid,omitempty"`
+	AssignedTotal int64 `json:"assigned_total,omitempty"`
+	MissedTotal   int64 `json:"missed_total,omitempty"`
+
+	Epoch         int64 `json:"epoch,omitempty"`
+	EpochAssigned int64 `json:"epoch_assigned,omitempty"`
+	EpochMissed   int64 `json:"epoch_missed,omitempty"`
+
+	LastBlockNum  int64     `json:"last_block_num,omitempty"`
+	LastBlockTime time.Time `json:"last_block_time,omitempty"`
+
+	Duties []bool `json:"duties,omitempty"`
 }
 
 // gnoSavedStats persists gnoland cumulative counters (prometheus gauges +
@@ -126,6 +154,19 @@ type ChainConfig struct {
 	// class, same as 2026-07-02/2026-07-28). Guarded by stateMux.
 	gnoBondMissStreak int
 	activeAlerts      int
+
+	// espresso provider runtime state (all guarded by stateMux).
+	espressoNode           *NodeConfig // the validator's own Status API, health-checked separately from the query nodes
+	espressoWin            *gnoWindow  // sliding leader-duty window (dashboard uptime %, percentage alarm)
+	espressoKey            string      // resolved BLS staking public key
+	espressoEpoch          int64       // current epoch reported by the stake table
+	espressoEpochAssigned  int64       // leader duties assigned in this epoch (from counter deltas)
+	espressoEpochMissed    int64       // leader duties missed in this epoch
+	espressoCountersValid  bool        // false until the first counter sample seeds the baseline
+	espressoAssignedTotal  int64       // last observed consensus_view_duration_as_leader_count
+	espressoMissedTotal    int64       // last observed consensus_number_of_timeouts_as_leader
+	espressoVoteLag        int64       // current_view - last_voted_view at the last health tick
+	espressoBondMissStreak int         // consecutive definitive not-in-active-set stake table answers
 
 	statTotalSigns      float64
 	statTotalProps      float64
@@ -170,6 +211,25 @@ type ChainConfig struct {
 	// gno.land has NO on-chain slashing module, so this is NOT a slashing window
 	// — it is a local health metric. Only used when Type == "gnoland". Default 10000.
 	GnoSignedBlocksWindow int `yaml:"gno_signed_blocks_window"`
+
+	// EspressoNodeURL is the base URL of the validator's own Espresso Status API
+	// (ESPRESSO_NODE_API_PORT). Only that node counts the leader slots assigned
+	// to it (consensus_view_duration_as_leader_count) and the ones it failed to
+	// propose (consensus_number_of_timeouts_as_leader); the public query service
+	// exposes per-epoch rates only, which are too coarse to alert on. Without
+	// this URL the chain is still watched for stalls and node lag, but leader
+	// duties are not tracked.
+	EspressoNodeURL string `yaml:"espresso_node_url"`
+	// EspressoStakingKey is the validator BLS staking public key
+	// (BLS_VER_KEY~...). Optional: discovered from the node's /v1/status/keys
+	// (falling back to the consensus_node metric) when empty.
+	EspressoStakingKey string `yaml:"espresso_staking_key"`
+	// EspressoDutyWindow is how many recent leader duties the dashboard uptime %
+	// and the percentage_missed alert are computed over. Default 1000.
+	EspressoDutyWindow int `yaml:"espresso_duty_window"`
+	// EspressoVoteLagViews is how many views the node's last vote may trail the
+	// current view before a "not voting" alarm fires. Default 100 (~45s).
+	EspressoVoteLagViews int `yaml:"espresso_vote_lag_views"`
 }
 
 // mkUpdate returns the info needed by prometheus for a gauge.
@@ -394,13 +454,33 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			v.Type = "cosmos"
 		}
 		switch v.Type {
-		case "cosmos", "gnoland":
+		case "cosmos", "gnoland", "espresso":
 			// ok
 		default:
-			problems = append(problems, fmt.Sprintf("warn: %20s has unknown chain type %q (expected cosmos or gnoland)", k, v.Type))
+			problems = append(problems, fmt.Sprintf("warn: %20s has unknown chain type %q (expected cosmos, gnoland or espresso)", k, v.Type))
 		}
 		if v.Type == "gnoland" && v.ValAddress == "" {
 			problems = append(problems, fmt.Sprintf("warn: %20s gnoland chain has no valoper_address; the signing address cannot be resolved and block monitoring stays inactive", k))
+		}
+		if v.Type == "espresso" {
+			if v.EspressoDutyWindow <= 0 {
+				v.EspressoDutyWindow = espressoDefaultDutyWindow
+			}
+			if v.EspressoVoteLagViews <= 0 {
+				v.EspressoVoteLagViews = espressoDefaultVoteLag
+			}
+			if v.espressoWin == nil {
+				v.espressoWin = newGnoWindow(v.EspressoDutyWindow)
+			}
+			if v.EspressoNodeURL == "" {
+				problems = append(problems, fmt.Sprintf("warn: %20s espresso chain has no espresso_node_url; leader duties (missed proposals) cannot be tracked, only chain liveness", k))
+			} else {
+				v.EspressoNodeURL = strings.TrimRight(v.EspressoNodeURL, "/")
+				v.espressoNode = &NodeConfig{Url: v.EspressoNodeURL, AlertIfDown: true}
+			}
+			if len(v.Nodes) == 0 {
+				problems = append(problems, fmt.Sprintf("warn: %20s espresso chain has no query service URLs under nodes", k))
+			}
 		}
 		switch strings.ToLower(v.Network) {
 		case "", "mainnet", "testnet":
@@ -714,6 +794,57 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 	// halted at first boot would never raise its stalled alarm.
 	for _, v := range c.Chains {
 		if v.Type == "gnoland" && v.lastBlockTime.IsZero() {
+			v.lastBlockTime = time.Now()
+		}
+	}
+
+	// restore espresso counters + the sliding duty window
+	for k, v := range saved.EspressoCounters {
+		cc := c.Chains[k]
+		if cc == nil || cc.Type != "espresso" {
+			continue
+		}
+		if cc.valInfo == nil {
+			cc.valInfo = &ValInfo{}
+		}
+		cc.statTotalSigns = v.TotalSigns
+		cc.statTotalProps = v.TotalProps
+		cc.statTotalMiss = v.TotalMiss
+		cc.statConsecutiveMiss = v.ConsecutiveMiss
+		cc.espressoCountersValid = v.CountersValid
+		cc.espressoAssignedTotal = v.AssignedTotal
+		cc.espressoMissedTotal = v.MissedTotal
+		cc.espressoEpoch = v.Epoch
+		cc.espressoEpochAssigned = v.EpochAssigned
+		cc.espressoEpochMissed = v.EpochMissed
+		cc.lastBlockNum = v.LastBlockNum
+		if cc.EspressoDutyWindow <= 0 {
+			cc.EspressoDutyWindow = espressoDefaultDutyWindow
+		}
+		cc.espressoWin = newGnoWindow(cc.EspressoDutyWindow)
+		for _, missed := range v.Duties {
+			cc.espressoWin.Push(missed)
+		}
+		cc.valInfo.Missed = int64(cc.espressoWin.Missed())
+		cc.valInfo.Window = int64(cc.espressoWin.Window())
+		// Same stall-clock guard as gnoland: a saved timestamp older than the
+		// threshold means the process was down for a long time — start the clock
+		// now instead of firing a false "stalled" critical on boot. A fresh
+		// timestamp resumes as-is so a real halt still alarms on time.
+		stalled := cc.Alerts.Stalled
+		if stalled <= 0 {
+			stalled = 10
+		}
+		if !v.LastBlockTime.IsZero() && time.Since(v.LastBlockTime) <= time.Duration(stalled)*time.Minute {
+			cc.lastBlockTime = v.LastBlockTime
+		} else {
+			cc.lastBlockTime = time.Now()
+		}
+		l(fmt.Sprintf("📂 restored espresso counters for %s (assigned=%d missed=%d duties=%d)",
+			k, v.AssignedTotal, v.MissedTotal, cc.espressoWin.Window()))
+	}
+	for _, v := range c.Chains {
+		if v.Type == "espresso" && v.lastBlockTime.IsZero() {
 			v.lastBlockTime = time.Now()
 		}
 	}

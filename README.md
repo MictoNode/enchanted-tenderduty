@@ -1,9 +1,10 @@
 # enchanted-tenderduty
 
 A validator monitoring and alerting service with a web dashboard and a
-Prometheus exporter. It watches Cosmos-SDK / Evmos chains **and** gnoland
-(gno.land / Tendermint 2) chains from a single binary, and alerts on missed
-blocks, stalled chains, jailed/inactive validators, and dead RPC nodes.
+Prometheus exporter. It watches Cosmos-SDK / Evmos chains, gnoland
+(gno.land / Tendermint 2) chains and Espresso (HotShot) validators from a
+single binary, and alerts on missed blocks, stalled chains, jailed/inactive
+validators, unreachable nodes, and validators that stopped voting.
 
 > Forked from [blockpane/tenderduty](https://github.com/blockpane/tenderduty).
 > The gnoland (gno.land / TM2) provider is ported from the
@@ -12,11 +13,12 @@ blocks, stalled chains, jailed/inactive validators, and dead RPC nodes.
 
 ## Features
 
-- **Dual-provider monitoring** in one binary:
+- **Tri-provider monitoring** in one binary:
   - `cosmos` (default) — Cosmos-SDK / Evmos chains via websocket + staking/slashing queries.
   - `gnoland` — gno.land / TM2 chains via HTTP polling (`/block`, `/validators`, `vm/qeval`), for public nodes that expose no websocket.
+  - `espresso` — Espresso (HotShot) validators: leader duties assigned/missed are read from the validator's own Status API, so a missed proposal alerts within seconds (the public query service only exposes per-epoch rates).
 - **Alerts** to Discord, Telegram, Slack, PagerDuty, and **Pushover** (emergency priority that breaks through Do Not Disturb).
-- **Web dashboard** — every chain (cosmos *and* gnoland, testnet *and* mainnet) shows up the same way: bonded/jailed status, missed-block grid, height, active alerts, with mainnet/testnet tabs driven by a per-chain `network` field.
+- **Web dashboard** — every chain (cosmos, gnoland *and* espresso, testnet *and* mainnet) shows up the same way: bonded/jailed status, missed-block grid (leader duties for espresso), height, active alerts, with mainnet/testnet tabs driven by a per-chain `network` field.
 - **Prometheus exporter** — gauges prefixed `tenderduty_*`.
 - **State persistence** — missed-block counters and alarm state survive restarts; written atomically every 60s while running, so a crash (SIGKILL/OOM/power loss) loses at most ~1 minute of dedup/counter state.
 - Backward compatible — existing cosmos configs keep working unchanged.
@@ -264,6 +266,27 @@ chains:
     nodes:
       - url: https://rpc.gno.example:443
         alert_if_down: yes
+
+  # ---- Espresso validator ----
+  "Espresso-M":
+    chain_id: espresso-mainnet-1        # cosmetic; identity is the BLS key
+    network: mainnet
+    type: espresso                      # selects the Espresso/HotShot provider
+    espresso_node_url: https://espresso-node.example.com:28181   # own Status API
+    # espresso_staking_key: BLS_VER_KEY~...   # blank = auto-discover from the node
+    espresso_duty_window: 1000          # leader duties for uptime % + percentage
+    alerts:
+      consecutive_enabled: yes          # 1 = alert on every missed leader duty
+      consecutive_missed: 1
+      consecutive_priority: critical
+      percentage_enabled: yes
+      percentage_missed: 1              # >1% of the duty window
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+    nodes:                              # query-service endpoints (head, poll-all)
+      - url: https://query.main.net.espresso.network
+        alert_if_down: yes
 ```
 
 See `example-config.yml` for the full set of fields (all five sinks with
@@ -275,9 +298,13 @@ per-chain overrides, healthcheck, etc.).
 |---|---|
 | `chain_id` | Chain ID; must match what the RPC `/status` reports. |
 | `network` | `mainnet` or `testnet` — drives the dashboard's tabs. Optional; empty = appears only in "all". |
-| `type` | `cosmos` (default) or `gnoland`. |
-| `valoper_address` | Validator **operator** address. Cosmos: `...valoper1...`. Gno: the operator `g1...` shown on gnoweb (the signing/consensus address is auto-derived). |
+| `type` | `cosmos` (default), `gnoland`, or `espresso`. |
+| `valoper_address` | Validator **operator** address. Cosmos: `...valoper1...`. Gno: the operator `g1...` shown on gnoweb (the signing/consensus address is auto-derived). Not used by espresso. |
 | `gno_valopers_realm` | (gnoland only) Realm path for moniker/signing lookup. Default `gno.land/r/gnops/valopers`. |
+| `espresso_node_url` | (espresso only) Base URL of the validator's own Status API (`/v1/status/*`). Required for missed-proposal monitoring; without it only chain liveness is tracked. |
+| `espresso_staking_key` | (espresso only) BLS staking public key. Optional — discovered from the node's `/v1/status/keys`. |
+| `espresso_duty_window` | (espresso only) Recent leader duties used for uptime % + `percentage_missed`. Default 1000. |
+| `espresso_vote_lag_views` | (espresso only) `current_view - last_voted_view` before a "not voting" warning. Default 100 (~45s). |
 | `alerts` | Alert thresholds + per-sink overrides (see `example-config.yml`). |
 | `nodes[]` | RPC endpoints; `alert_if_down` toggles node-down alerts. |
 
@@ -289,6 +316,15 @@ per-chain overrides, healthcheck, etc.).
 - gno has **no on-chain slashing module**, so there is no slashing window to query. The optional `gno_signed_blocks_window` (default 10000) defines a **LOCAL sliding signing-health window** (last N blocks) that drives the dashboard uptime % and the `percentage_missed` alert — it is a health metric, **not** a slashing window. At ~3.5s blocks 10000 ≈ 9.7 hours; use a smaller value (e.g. 1000 ≈ 1h) if you want the uptime % to react faster. `consecutive_missed` remains the **primary** gno alert.
 - A validator that is resolved but **not in the active set** is not expected to sign, so it neither accrues missed counters nor fires false consecutive alerts; the dashboard shows its blocks as "No Data".
 - Inactive detection: gno has no jail, so the "jailed" alert fires when the validator **leaves the active set** (bonded → unbonded, debounced over two health ticks). Last processed height and block time are persisted, so a restart resumes where it stopped and does not mask a stalled chain.
+
+### espresso notes
+
+- HotShot has **no per-validator block signature** and the public query service publishes only per-epoch **participation rates** (`/v1/node/participation/proposal/{epoch}`) — no counts, no leader schedule, no DRB. The validator's own Status API is the authoritative source: `consensus_view_duration_as_leader_count` is the number of leader slots assigned to the node and `consensus_number_of_timeouts_as_leader` the ones it failed to propose, so `proposals = assigned - missed`. Verified against public validators: the counter ratio matches the delegation program's published weekly miss rate.
+- Point `espresso_node_url` at the node's Status API (`ESPRESSO_NODE_API_PORT`). It serves plain HTTP — put it behind an HTTPS reverse proxy or allow only the monitoring host through the firewall. The BLS staking key, operator address and node name are discovered from `/v1/status/keys` and the `consensus_node` / `consensus_node_identity_general` metrics.
+- `nodes[]` are **query-service** endpoints, not the validator. Every configured endpoint is asked for the chain head each poll and the highest height wins, so one stale endpoint cannot freeze monitoring or mask a stalled chain (same model as gnoland). The public mainnet query service is `https://query.main.net.espresso.network`.
+- The dashboard grid shows the most recent **leader duties** (green = proposed, orange = missed), newest first — the same "did I do my job for this slot" meaning it has for cosmos/gno. Uptime % and `percentage_missed` are computed over the last `espresso_duty_window` duties with real counts and are persisted across restarts, so there is no warm-up gap.
+- Extra alarms: `validator node ... is not responding` (own Status API down longer than `node_down_alert_minutes`) and `... has not voted ... in N views` (`current_view - last_voted_view` exceeds `espresso_vote_lag_views` while the chain keeps moving — the node lost consensus connectivity).
+- Counter drops mean the node restarted (Prometheus counters are process-lifetime); the baseline is re-seeded instead of reporting a bogus delta. Inactive detection is stake-table membership, debounced over two health ticks (Espresso has no jail).
 
 ---
 

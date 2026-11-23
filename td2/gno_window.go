@@ -44,6 +44,20 @@ func (w *gnoWindow) Push(missed bool) {
 // Missed returns the count of missed blocks currently in the window.
 func (w *gnoWindow) Missed() int { return w.missed }
 
+// Entries returns the window's outcomes oldest-first. Used to persist the
+// espresso duty window so a restart does not spend hours warming it up.
+func (w *gnoWindow) Entries() []bool {
+	out := make([]bool, 0, w.size)
+	start := w.head - w.size
+	if start < 0 {
+		start += w.cap
+	}
+	for i := 0; i < w.size; i++ {
+		out = append(out, w.buf[(start+i)%w.cap])
+	}
+	return out
+}
+
 // Window returns the number of blocks currently in the window (grows 0->cap
 // during warm-up, then stable at cap).
 func (w *gnoWindow) Window() int { return w.size }

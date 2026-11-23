@@ -4,7 +4,7 @@
 # Every field below corresponds to a real option in td2/types.go. Commented
 # values are optional / have working defaults. Copy to config.yml and edit.
 # Supported alert sinks: discord, telegram, slack, pagerduty, pushover.
-# Supported chain types: cosmos (default) and gnoland.
+# Supported chain types: cosmos (default), gnoland and espresso.
 # =============================================================================
 
 # --- general -----------------------------------------------------------------
@@ -140,7 +140,7 @@ chains:
       - url: https://some-other-node:443
         alert_if_down: no
 
-  # ----- Gnoland example -----
+  # ----- Gnoland (gno.land / TM2) example -----
   # `type: gnoland` selects the gnoland provider: TM2 public nodes expose no
   # websocket, so it reads the head from every configured node (/status, every
   # 5s, max height wins) and evaluates EVERY height in between via
@@ -151,33 +151,97 @@ chains:
   # (gno.land/r/gnops/valopers:<operator>). The signing/consensus address used
   # by /validators and /commit is auto-derived from the realm — do NOT put the
   # signing address here. The operator needs a profile in the valopers realm.
-  # Mainnet: chain_id: gnoland-1, public RPC https://rpc.gno.land.
-  # "Gno-Testnet":
-  #   chain_id: test11
-  #   network: testnet
-  #   type: gnoland
-  #   valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # operator addr (gnoweb)
-  #   gno_valopers_realm: "gno.land/r/gnops/valopers"             # default; override only if needed
-  #   gno_signed_blocks_window: 10000                              # gno has NO on-chain slashing window;
-  #                                                                # this LOCAL sliding window (last N
-  #                                                                # blocks) drives uptime % + percentage.
-  #                                                                # Default 10000 (~9.7h at 3.5s blocks).
-  #   alerts:
-  #     stalled_enabled: yes
-  #     stalled_minutes: 5
-  #     consecutive_enabled: yes
-  #     consecutive_missed: 10
-  #     consecutive_priority: critical
-  #     percentage_enabled: no
-  #     percentage_missed: 10
-  #     percentage_priority: warning
-  #     alert_if_inactive: yes
-  #     alert_if_no_servers: yes
-  #     pushover:
-  #       enabled: yes
-  #       priority: 2
-  #       retry: 30
-  #       expire: 3600
-  #   nodes:
-  #     - url: https://rpc.gno.example:443
-  #       alert_if_down: yes
+  "Gno-Mainnet":
+    chain_id: gnoland-1
+    network: mainnet
+    type: gnoland
+    valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # OPERATOR addr (gnoweb)
+    gno_valopers_realm: "gno.land/r/gnops/valopers"             # default; override only if needed
+    # gno_signed_blocks_window: 10000                            # gno has NO on-chain slashing
+    #                                                            # window; this LOCAL sliding window
+    #                                                            # (last N blocks) drives uptime % +
+    #                                                            # percentage. Default 10000 (~9.7h).
+    alerts:
+      stalled_enabled: yes
+      stalled_minutes: 5
+      consecutive_enabled: yes      # primary gno alert
+      consecutive_missed: 10
+      consecutive_priority: critical
+      percentage_enabled: no
+      percentage_missed: 10
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+      # Blank sink credentials fall back to the global values; `enabled` must be
+      # yes both here and globally.
+      discord:
+        enabled: yes
+        webhook: ""
+      telegram:
+        enabled: yes
+        api_key: ""
+        channel: ""
+      pushover:
+        enabled: yes
+        priority: 2
+        retry: 30
+        expire: 3600
+    nodes:
+      # Head detection polls all nodes and picks the highest height; commit
+      # fetches fall back to any healthy node. Two independent endpoints avoid
+      # a single stale RPC freezing monitoring.
+      - url: https://rpc.gno.land:443
+        alert_if_down: yes
+      - url: https://gnoland-mainnet-rpc.itrocket.net:443
+        alert_if_down: yes
+
+  # ----- Espresso (HotShot) example -----
+  # `type: espresso` selects the HotShot/Espresso provider. Espresso has no
+  # cosmos staking/slashing and no TM2 websocket, and the public query service
+  # returns per-epoch participation RATES only (too coarse to alert on). Missed
+  # proposals are therefore counted on the validator's own Status API:
+  #   consensus_view_duration_as_leader_count  = leader duties assigned
+  #   consensus_number_of_timeouts_as_leader   = leader duties missed
+  # proposals = assigned - missed. A counter drop means the node restarted, so
+  # the baseline is re-seeded instead of reporting bogus deltas.
+  # nodes = query-service endpoints (chain head; poll-all, max height wins).
+  # espresso_node_url = the validator's own Status API (ESPRESSO_NODE_API_PORT;
+  # default 8080, the community guide exposes 28181). It serves plain HTTP —
+  # put it behind an HTTPS reverse proxy or allow only the monitoring host.
+  # Without it, stalls/lag are still monitored but leader duties are not.
+  # espresso_staking_key is optional: discovered from /v1/status/keys.
+  "Espresso-M":
+    chain_id: espresso-mainnet-1        # cosmetic; identity is the BLS key
+    network: mainnet
+    type: espresso
+    espresso_node_url: https://espresso-node.example.com:28181
+    # espresso_staking_key: BLS_VER_KEY~...   # blank = auto-discover from the node
+    espresso_duty_window: 1000          # recent leader duties for uptime % +
+                                        # percentage_missed (real counts)
+    espresso_vote_lag_views: 100        # current_view - last_voted_view before a
+                                        # "not voting" warning (~45s)
+    alerts:
+      stalled_enabled: yes
+      stalled_minutes: 3
+      consecutive_enabled: yes
+      consecutive_missed: 1             # 1 = alert on every missed leader duty
+      consecutive_priority: critical
+      percentage_enabled: yes
+      percentage_missed: 1              # >1% missed over the duty window
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+      discord:
+        enabled: yes
+        webhook: ""
+      telegram:
+        enabled: yes
+        api_key: ""
+        channel: ""
+    nodes:
+      - url: https://query.main.net.espresso.network
+        alert_if_down: yes
+      # Add your own query node (or another public one) as a second endpoint:
+      # head detection takes the highest height, so one stale service cannot
+      # freeze monitoring.
+

@@ -33,6 +33,9 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 	if cc.Type == "gnoland" {
 		return cc.GnoGetValInfo(first)
 	}
+	if cc.Type == "espresso" {
+		return cc.EspressoGetValInfo(first)
+	}
 	cc.stateMux.RLock()
 	client := cc.client
 	cc.stateMux.RUnlock()

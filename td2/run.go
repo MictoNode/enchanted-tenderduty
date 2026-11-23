@@ -193,13 +193,33 @@ func snapshotStateOf(c *Config) ([]byte, error) {
 		}
 		v.stateMux.RUnlock()
 	}
+	espressoCounters := make(map[string]*espressoSavedStats)
+	for k, v := range chains {
+		v.stateMux.RLock()
+		if v.Type == "espresso" && v.valInfo != nil {
+			es := &espressoSavedStats{
+				TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
+				TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
+				CountersValid: v.espressoCountersValid,
+				AssignedTotal: v.espressoAssignedTotal, MissedTotal: v.espressoMissedTotal,
+				Epoch: v.espressoEpoch, EpochAssigned: v.espressoEpochAssigned, EpochMissed: v.espressoEpochMissed,
+				LastBlockNum: v.lastBlockNum, LastBlockTime: v.lastBlockTime,
+			}
+			if v.espressoWin != nil {
+				es.Duties = v.espressoWin.Entries()
+			}
+			espressoCounters[k] = es
+		}
+		v.stateMux.RUnlock()
+	}
 	alarms.notifyMux.RLock()
 	defer alarms.notifyMux.RUnlock()
 	return json.Marshal(&savedState{
-		Alarms:      alarms,
-		Blocks:      blocks,
-		NodesDown:   nodesDown,
-		GnoCounters: gnoCounters,
+		Alarms:           alarms,
+		Blocks:           blocks,
+		NodesDown:        nodesDown,
+		GnoCounters:      gnoCounters,
+		EspressoCounters: espressoCounters,
 	})
 }
 
