@@ -612,21 +612,11 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			problems = append(problems, fmt.Sprintf("warn: %20s has no notifications configured", k))
 		}
 		if td.EnableDash {
-			td.updateChan <- &dash.ChainStatus{
-				MsgType: "status",
-				Name:    v.name,
-				ChainId: v.ChainId, Network: v.Network,
-				Moniker:      v.valInfo.Moniker,
-				Bonded:       v.valInfo.Bonded,
-				Jailed:       v.valInfo.Jailed,
-				Tombstoned:   v.valInfo.Tombstoned,
-				Missed:       v.valInfo.Missed,
-				Window:       v.valInfo.Window,
-				Nodes:        len(v.Nodes),
-				HealthyNodes: 0,
-				ActiveAlerts: 0,
-				Blocks:       v.blocksResults,
-			}
+			// Build the initial snapshot through statusUpdate so provider-specific
+			// fields (espresso epoch tally, validator node in the node count) are
+			// present from the first frame; the old literal showed nodes:1 and no
+			// epoch until the first poll update.
+			td.updateChan <- v.statusUpdate()
 		}
 	}
 
