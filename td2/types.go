@@ -167,6 +167,7 @@ type ChainConfig struct {
 	espressoMissedTotal    int64       // last observed consensus_number_of_timeouts_as_leader
 	espressoVoteLag        int64       // current_view - last_voted_view at the last health tick
 	espressoMetricsValid   bool        // a served metrics snapshot was parsed (vote lag is meaningful even with zero duties)
+	espressoKeyMismatch    bool        // espresso_node_url answers with a BLS key different from espresso_staking_key (foreign node)
 	espressoBondMissStreak int         // consecutive definitive not-in-active-set stake table answers
 	espressoMoniker        string      // node identity label, shared from the poller to avoid refetching metrics
 	espressoStakeTableAt   time.Time   // last successful stake table fetch (rate-limits the 45KB payload)

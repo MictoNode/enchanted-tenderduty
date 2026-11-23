@@ -804,3 +804,54 @@ func TestEspressoPollStartsDutiesWhenKeyResolvesLater(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestEspressoGetValInfoDetectsForeignNode: the duty counters are node-local, so
+// pointing espresso_node_url at another operator's node would monitor THEIR
+// proposals. With espresso_staking_key pinned, a key mismatch must disable duty
+// accounting (and log), not silently track the foreign validator.
+func TestEspressoGetValInfoDetectsForeignNode(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+
+	m := &espressoMock{current: 1000, voted: 999, height: 500}
+	m.set(10, 0, 500)
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	cc := newEspressoTestChain(srv.URL) // pin == the node's key
+	if err := cc.EspressoGetValInfo(false); err != nil {
+		t.Fatalf("GetValInfo: %v", err)
+	}
+	if cc.espressoKeyMismatch {
+		t.Fatal("matching node key flagged as a mismatch")
+	}
+
+	// Pin a different key: the node belongs to someone else.
+	cc.EspressoStakingKey = "BLS_VER_KEY~some-other-operator-key"
+	cc.espressoKey = ""
+	if err := cc.EspressoGetValInfo(false); err != nil {
+		t.Fatalf("GetValInfo after mismatch: %v", err)
+	}
+	if !cc.espressoKeyMismatch {
+		t.Fatal("foreign node not detected")
+	}
+
+	// The poller must not account duties from the foreign node.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+	cc.lastBlockNum = 500
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	<-done
+
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
+	if cc.espressoCountersValid || cc.valInfo.Window != 0 {
+		t.Fatalf("foreign node contributed duty data: valid=%v window=%d", cc.espressoCountersValid, cc.valInfo.Window)
+	}
+	if cc.blocksResults[0] != -1 {
+		t.Fatalf("grid painted as signed while duty monitoring is disabled: %d", cc.blocksResults[0])
+	}
+}

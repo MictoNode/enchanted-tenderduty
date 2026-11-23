@@ -59,17 +59,21 @@ func (cc *ChainConfig) EspressoPollRun() {
 	} else {
 		cc.stateMux.RLock()
 		key := cc.espressoKey
+		mismatch := cc.espressoKeyMismatch
 		cc.stateMux.RUnlock()
 		if key == "" {
 			key = cc.EspressoStakingKey
 		}
-		if key == "" {
+		switch {
+		case mismatch:
+			l(fmt.Sprintf("🛑 %-12s node %s is not this validator (BLS key mismatch); leader-duty monitoring stays off until the config is fixed", cc.ChainId, cc.EspressoNodeURL))
+		case key == "":
 			// Not fatal: the health tick resolves the key from /v1/status/keys and
 			// a later tick starts duty polling. Latching this off would disable
 			// duty monitoring for the whole process if the node was briefly down
 			// when the poller started.
 			l(fmt.Sprintf("⚠️ %-12s no BLS staking key yet; leader-duty polling starts once the node answers /v1/status/keys", cc.ChainId))
-		} else {
+		default:
 			l(fmt.Sprintf("⚙️ %-12s polling %d query node(s) and node %s for leader duties", cc.ChainId, len(cc.Nodes), cc.EspressoNodeURL))
 		}
 	}
@@ -107,11 +111,12 @@ func (cc *ChainConfig) EspressoPollRun() {
 			var nodeErr error
 			cc.stateMux.RLock()
 			key := cc.espressoKey
+			mismatch := cc.espressoKeyMismatch
 			cc.stateMux.RUnlock()
 			if key == "" {
 				key = cc.EspressoStakingKey
 			}
-			duties := cc.EspressoNodeURL != "" && key != ""
+			duties := cc.EspressoNodeURL != "" && key != "" && !mismatch
 			if duties && tickN%espressoMetricsEveryTicks == 1 {
 				st, nodeErr = espressoFetchStatus(cc.EspressoNodeURL)
 				if st != nil && st.Moniker != "" {

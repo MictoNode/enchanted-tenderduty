@@ -205,11 +205,14 @@ chains:
   # proposals = assigned - missed. A counter drop means the node restarted, so
   # the baseline is re-seeded instead of reporting bogus deltas.
   # nodes = query-service endpoints (chain head; poll-all, max height wins).
-  # espresso_node_url = the validator's own Status API (ESPRESSO_NODE_API_PORT;
-  # default 8080, the community guide exposes 28181). It serves plain HTTP —
-  # put it behind an HTTPS reverse proxy or allow only the monitoring host.
-  # Without it, stalls/lag are still monitored but leader duties are not.
-  # espresso_staking_key is optional: discovered from /v1/status/keys.
+  # espresso_node_url = YOUR validator's own Status API (ESPRESSO_NODE_API_PORT;
+  # default 8080, the community guide exposes 28181). The duty counters are
+  # node-local, so another operator's node would report THEIR proposals. It
+  # serves plain HTTP — put it behind an HTTPS reverse proxy or allow only the
+  # monitoring host. Without it, stalls/lag are still monitored but leader
+  # duties are not. espresso_staking_key is optional (discovered from
+  # /v1/status/keys); when set, a node reporting a different key disables duty
+  # monitoring instead of tracking a foreign validator.
   "Espresso-M":
     chain_id: espresso-mainnet-1        # cosmetic; identity is the BLS key
     network: mainnet

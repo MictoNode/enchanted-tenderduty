@@ -393,6 +393,12 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 		}
 		return errors.New("espresso staking key unknown")
 	}
+	// A foreign node (someone else's validator) answers /v1/status/keys with
+	// THEIR BLS key, and both duty counters are node-local: accounting from it
+	// would monitor their proposals under our name. Only detectable when the
+	// operator pinned espresso_staking_key; without it the node is the only
+	// identity source, so the deploy docs must point it at our own validator.
+	mismatch := cc.EspressoStakingKey != "" && nodeKey != "" && nodeKey != cc.EspressoStakingKey
 
 	// Active set: poll every non-down query node and take the first healthy
 	// stake table (poll-all, same reasoning as GnoGetValInfo). The table is 45KB
@@ -449,6 +455,18 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 	}
 	if moniker != "" && moniker != "not connected" {
 		cc.espressoMoniker = moniker
+	}
+
+	// Transition-only log: a wrong espresso_node_url silently monitoring another
+	// operator's duties is the one mistake this guard can catch.
+	if mismatch != cc.espressoKeyMismatch {
+		cc.espressoKeyMismatch = mismatch
+		if mismatch {
+			l(fmt.Sprintf("🛑 %-12s node %s reports %s, not the configured espresso_staking_key %s; duty monitoring disabled — point espresso_node_url at YOUR validator",
+				cc.ChainId, cc.EspressoNodeURL, espressoShortKey(nodeKey), espressoShortKey(key)))
+		} else {
+			l(fmt.Sprintf("✅ %-12s node key matches espresso_staking_key again; duty monitoring resumed", cc.ChainId))
+		}
 	}
 
 	cc.espressoKey = key
