@@ -550,3 +550,37 @@ func TestEspressoSavedStateRoundTrip(t *testing.T) {
 		t.Fatalf("restored window: missed=%d window=%d, want 2/4", restored.Missed(), restored.Window())
 	}
 }
+
+// TestEspressoStatusIncludesEpochTally: the dashboard row exposes the current
+// epoch's assigned/missed leader duties (the delegation-program bot format).
+// Non-espresso chains must not report an epoch at all.
+func TestEspressoStatusIncludesEpochTally(t *testing.T) {
+	orig := alarms
+	t.Cleanup(func() { alarms = orig })
+	alarms = &alarmCache{AllAlarms: map[string]map[string]time.Time{}}
+
+	cc := newEspressoTestChain("http://127.0.0.1:1")
+	cc.espressoEpoch = 845
+	cc.espressoEpochAssigned = 412
+	cc.espressoEpochMissed = 1
+	cc.valInfo.Missed = 1
+	cc.valInfo.Window = 1000
+
+	cc.stateMux.Lock()
+	st := cc.statusUpdate()
+	cc.stateMux.Unlock()
+	if st.Epoch != 845 || st.EpochAssigned != 412 || st.EpochMissed != 1 {
+		t.Fatalf("epoch tally: %+v", st)
+	}
+	if st.Missed != 1 || st.Window != 1000 {
+		t.Fatalf("window counters changed: missed=%d window=%d", st.Missed, st.Window)
+	}
+
+	cc.Type = "gnoland"
+	cc.stateMux.Lock()
+	st = cc.statusUpdate()
+	cc.stateMux.Unlock()
+	if st.Epoch != 0 || st.EpochAssigned != 0 || st.EpochMissed != 0 {
+		t.Fatalf("non-espresso chain reported an epoch: %+v", st)
+	}
+}

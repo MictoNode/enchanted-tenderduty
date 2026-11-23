@@ -159,6 +159,12 @@ function updateTableStable(chains) {
         const alertTitle = chain.last_error || 'Active alert';
         const alertHtml = hasAlert ? `<i data-lucide="triangle-alert" title="${escapeHtml(alertTitle)}"></i>` : '';
 
+        // Espresso reports a current-epoch duty tally (like the delegation bots);
+        // other providers have no epoch, so the line stays empty.
+        const epochLine = chain.epoch > 0
+            ? `epoch ${chain.epoch} · ${chain.epoch_missed || 0} missed / ${chain.epoch_assigned || 0} assigned`
+            : '';
+
         const healthy = chain.healthy_nodes || 0;
         const total = chain.nodes || 0;
         let dotsHtml = '';
@@ -180,6 +186,7 @@ function updateTableStable(chains) {
                     <div class="td-uptime">
                         <span class="td-uptime-percent" style="${uptimeColor}">${uptimePct}</span>
                         <span class="td-uptime-ratio">${chain.missed} / ${chain.window}</span>
+                        <span class="td-uptime-epoch">${epochLine}</span>
                         <span class="td-uptime-bar"><span class="td-uptime-bar-fill" style="width:${barWidth}%;background:${barColor};"></span></span>
                     </div>
                 </td>
@@ -226,6 +233,16 @@ function updateTableStable(chains) {
             const upRatio = row.querySelector('.td-uptime-ratio');
             const ratioText = `${chain.missed} / ${chain.window}`;
             if (upRatio && upRatio.textContent !== ratioText) upRatio.textContent = ratioText;
+
+            // Espresso epoch tally (row may predate the first epoch sample)
+            let epochEl = row.querySelector('.td-uptime-epoch');
+            if (!epochEl && epochLine) {
+                epochEl = document.createElement('span');
+                epochEl.className = 'td-uptime-epoch';
+                const upBlock = row.querySelector('.td-uptime');
+                if (upBlock) upBlock.appendChild(epochEl);
+            }
+            if (epochEl && epochEl.textContent !== epochLine) epochEl.textContent = epochLine;
 
             // Uptime bar
             const barFill = row.querySelector('.td-uptime-bar-fill');

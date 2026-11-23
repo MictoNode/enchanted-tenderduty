@@ -294,6 +294,11 @@ func (cc *ChainConfig) statusUpdate() *dash.ChainStatus {
 		st.Missed = cc.valInfo.Missed
 		st.Window = cc.valInfo.Window
 	}
+	if cc.Type == "espresso" {
+		st.Epoch = cc.espressoEpoch
+		st.EpochAssigned = cc.espressoEpochAssigned
+		st.EpochMissed = cc.espressoEpochMissed
+	}
 	return st
 }
 

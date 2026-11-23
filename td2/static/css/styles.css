@@ -340,6 +340,7 @@ body {
 .td-height,
 .td-uptime-percent,
 .td-uptime-ratio,
+.td-uptime-epoch,
 .td-chain-id,
 .td-nodes {
   font-variant-numeric: tabular-nums;
@@ -430,6 +431,13 @@ body {
 
 .td-uptime-ratio {
   font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Espresso: current-epoch leader-duty tally ("0 missed / 412 assigned"). */
+.td-uptime-epoch {
+  font-size: 0.7rem;
   color: var(--text-muted);
   font-family: 'JetBrains Mono', monospace;
 }
