@@ -235,9 +235,10 @@ func TestEspressoPollRecordsDutyOutcomes(t *testing.T) {
 		t.Fatalf("duty window: %+v, want missed=4 window=5", cc.valInfo)
 	}
 	// Grid is newest-first and per BLOCK, with one cell per missed duty inserted
-	// in front of that tick's block cells: tick2 pushed [signed, missed], tick3
-	// (lower head, no new blocks) pushed three missed cells.
-	want := []int{int(Statusmissed), int(Statusmissed), int(Statusmissed), int(Statusmissed), int(StatusSigned)}
+	// in front of that tick's block cells. Tick2 had one successful proposal, so
+	// the newest signed block cell was painted green (proposed); tick3 (lower
+	// head, no new blocks) pushed three missed cells.
+	want := []int{int(Statusmissed), int(Statusmissed), int(Statusmissed), int(Statusmissed), int(StatusProposed)}
 	for i, w := range want {
 		if cc.blocksResults[i] != w {
 			t.Fatalf("grid[%d]=%d, want %d (grid=%v)", i, cc.blocksResults[i], w, cc.blocksResults[:6])

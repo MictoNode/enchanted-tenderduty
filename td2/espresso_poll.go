@@ -122,11 +122,12 @@ func (cc *ChainConfig) EspressoPollRun() {
 			}
 
 			var (
-				logMsgs   []string
-				cells     []int
-				missCells []int
-				advanced  bool
-				events    int
+				logMsgs      []string
+				cells        []int
+				missCells    []int
+				proposedCell int
+				advanced     bool
+				events       int
 			)
 
 			cc.stateMux.Lock()
@@ -175,6 +176,14 @@ func (cc *ChainConfig) EspressoPollRun() {
 					successes := dAssigned - dMissed
 					if successes < 0 {
 						successes = 0
+					}
+					// Successful leader duties produced blocks: paint that many of
+					// this tick's block cells green (proposed) instead of signed.
+					if successes > 0 {
+						proposedCell = int(successes)
+						if proposedCell > 32 {
+							proposedCell = 32
+						}
 					}
 					cc.espressoAssignedTotal = st.Assigned
 					cc.espressoMissedTotal = st.Missed
@@ -294,6 +303,17 @@ func (cc *ChainConfig) EspressoPollRun() {
 			// cells from the same tick and stay visible for a full grid cycle.
 			cells = append(cells, missCells...)
 			cc.espressoPrependGrid(cells)
+			// Successful leader duties produced blocks. The counters do not say
+			// which block, so paint the newest signed cell(s) green (proposed);
+			// doing it after the prepend puts the green cell at the leading edge.
+			// Miss cells sit in front, so skip them while looking for signed cells.
+			painted := 0
+			for i := 0; i < len(cc.blocksResults) && painted < proposedCell; i++ {
+				if cc.blocksResults[i] == int(StatusSigned) {
+					cc.blocksResults[i] = int(StatusProposed)
+					painted++
+				}
+			}
 			height := cc.lastBlockNum
 			moniker := cc.valInfo.Moniker
 			status := cc.statusUpdate()
