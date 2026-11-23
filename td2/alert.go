@@ -577,6 +577,7 @@ type currentAlarmMessages struct {
 	stalled     string
 	consecutive string
 	percentage  string
+	vote        string
 }
 
 // obsolete reports whether msg is a cached alarm of a known configurable type
@@ -593,6 +594,10 @@ func (cur currentAlarmMessages) obsolete(msg string, a AlertConfig) bool {
 		return !a.PercentageAlerts || msg != cur.percentage
 	case strings.Contains(msg, " has missed "):
 		return !a.ConsecutiveAlerts || msg != cur.consecutive
+	case strings.Contains(msg, " has not voted on "):
+		// embeds espresso_vote_lag_views and the moniker; a config change would
+		// otherwise leave the old message in the cache forever.
+		return msg != cur.vote
 	}
 	return false
 }
@@ -613,17 +618,28 @@ func (cc *ChainConfig) clearObsoleteAlarms() {
 	}
 	windowDesc := "slashing window's"
 	consecWhat := "blocks"
+	pctMsg := ""
+	voteMsg := ""
 	switch cc.Type {
 	case "gnoland":
 		windowDesc = "signing-health window's"
 	case "espresso":
-		windowDesc = "leader-duty window's"
 		consecWhat = "leader duties"
+		pctMsg = fmt.Sprintf("%s has missed > %d%% of its assigned leader duties on %s", moniker, cc.Alerts.Window, cc.ChainId)
+		thr := int64(cc.EspressoVoteLagViews)
+		if thr <= 0 {
+			thr = espressoDefaultVoteLag
+		}
+		voteMsg = fmt.Sprintf("%s has not voted on %s in %d views", moniker, cc.ChainId, thr)
+	}
+	if pctMsg == "" {
+		pctMsg = fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", moniker, cc.Alerts.Window, windowDesc, cc.ChainId)
 	}
 	cur := currentAlarmMessages{
 		stalled:     fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
 		consecutive: fmt.Sprintf("%s has missed %d %s on %s", moniker, cc.Alerts.ConsecutiveMissed, consecWhat, cc.ChainId),
-		percentage:  fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", moniker, cc.Alerts.Window, windowDesc, cc.ChainId),
+		percentage:  pctMsg,
+		vote:        voteMsg,
 	}
 	alarms.notifyMux.RLock()
 	msgs := make([]string, 0, len(alarms.AllAlarms[cc.name]))
@@ -800,24 +816,49 @@ func (cc *ChainConfig) watch() {
 
 		// window percentage missed block alarms (same cache-driven pattern).
 		windowDesc := "slashing window's"
-		switch cc.Type {
-		case "gnoland":
+		if cc.Type == "gnoland" {
 			// gno has no slashing; the window is a local signing-health window.
 			windowDesc = "signing-health window's"
-		case "espresso":
-			// Espresso has no slashing either; the window counts leader duties.
-			windowDesc = "leader-duty window's"
 		}
 		pctMsg := fmt.Sprintf("%s has missed > %d%% of the %s blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, windowDesc, cc.ChainId)
-		switch percentageMissedTransition(cc.Alerts.PercentageAlerts, alarms.hasMessage(cc.name, pctMsg), cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
-		case "fire":
-			id := cc.valInfo.Valcons + "percent"
-			td.alert(cc.name, pctMsg, cc.Alerts.PercentagePriority, false, &id)
-			cc.activeAlerts = alarms.getCount(cc.name)
-		case "resolve":
-			id := cc.valInfo.Valcons + "percent"
-			td.alert(cc.name, pctMsg, "info", true, &id)
-			cc.activeAlerts = alarms.getCount(cc.name)
+		pctID := cc.valInfo.Valcons + "percent"
+		if cc.Type == "espresso" {
+			// The window counts assigned leader duties, not blocks: say so.
+			pctMsg = fmt.Sprintf("%s has missed > %d%% of its assigned leader duties on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId)
+			minWin := int64(espressoPercentageMinWindow)
+			if cc.EspressoDutyWindow > 0 && int64(cc.EspressoDutyWindow) < minWin {
+				// Never require more duties than the configured window can hold,
+				// or a small espresso_duty_window would silently disable the alarm.
+				minWin = int64(cc.EspressoDutyWindow)
+			}
+			switch {
+			case cc.valInfo.Window < minWin:
+				// One miss in a 2-duty window is "50%": a meaningless critical on
+				// a fresh start. consecutive_missed already covers individual
+				// misses; only resolve a stale alarm (config shrank the window).
+				if alarms.hasMessage(cc.name, pctMsg) {
+					td.alert(cc.name, pctMsg, "info", true, &pctID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				}
+			default:
+				switch percentageMissedTransition(cc.Alerts.PercentageAlerts, alarms.hasMessage(cc.name, pctMsg), cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
+				case "fire":
+					td.alert(cc.name, pctMsg, cc.Alerts.PercentagePriority, false, &pctID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				case "resolve":
+					td.alert(cc.name, pctMsg, "info", true, &pctID)
+					cc.activeAlerts = alarms.getCount(cc.name)
+				}
+			}
+		} else {
+			switch percentageMissedTransition(cc.Alerts.PercentageAlerts, alarms.hasMessage(cc.name, pctMsg), cc.valInfo.Missed, cc.valInfo.Window, cc.Alerts.Window) {
+			case "fire":
+				td.alert(cc.name, pctMsg, cc.Alerts.PercentagePriority, false, &pctID)
+				cc.activeAlerts = alarms.getCount(cc.name)
+			case "resolve":
+				td.alert(cc.name, pctMsg, "info", true, &pctID)
+				cc.activeAlerts = alarms.getCount(cc.name)
+			}
 		}
 
 		// Espresso-specific alarms: validator node unreachable and "not voting".
@@ -847,10 +888,18 @@ func (cc *ChainConfig) watch() {
 			if thr <= 0 {
 				thr = espressoDefaultVoteLag
 			}
-			if cc.espressoCountersValid && cc.valInfo != nil {
+			if cc.espressoMetricsValid && cc.valInfo != nil {
 				voteMsg := fmt.Sprintf("%s has not voted on %s in %d views", cc.valInfo.Moniker, cc.ChainId, thr)
 				voteID := cc.valInfo.Valcons + "votelag"
+				nodeDown := cc.espressoNode != nil && cc.espressoNode.down
 				switch {
+				case nodeDown:
+					// The node-down alarm owns this failure; resolve a stale
+					// not-voting entry so it cannot linger in the cache.
+					if alarms.hasMessage(cc.name, voteMsg) {
+						td.alert(cc.name, voteMsg, "info", true, &voteID)
+						cc.activeAlerts = alarms.getCount(cc.name)
+					}
 				case !alarms.hasMessage(cc.name, voteMsg) && cc.espressoVoteLag >= thr:
 					td.alert(cc.name, voteMsg, "warning", false, &voteID)
 					cc.activeAlerts = alarms.getCount(cc.name)

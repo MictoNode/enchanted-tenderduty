@@ -42,6 +42,15 @@ const (
 	// failure must not raise a false "not in the active set" critical.
 	espressoBondedConfirmTicks = 2
 	espressoQueryTimeout       = 10 * time.Second
+	// espressoMetricsEveryTicks fetches the node's /status/metrics every N poll
+	// ticks. The payload is ~75KB plain (~10KB gzipped) and leader duties only
+	// arrive every ~1-2 minutes at a small stake share; polling it every 5s
+	// would burn ~200MB/day for no extra signal. Chain head stays at 5s.
+	espressoMetricsEveryTicks = 3
+	// espressoPercentageMinWindow is how many assigned leader duties the window
+	// must contain before the percentage alarm is evaluated: one miss in a
+	// 2-duty window is "50%", a false critical that consecutive_missed covers.
+	espressoPercentageMinWindow = 100
 )
 
 var (
@@ -49,7 +58,26 @@ var (
 	espressoPollIdleExit    = 2 * time.Minute
 	espressoHealthInterval  = time.Minute
 	espressoHealthRetryWait = 2 * time.Second
+	// espressoStakeTableInterval bounds how often the stake table (45KB,
+	// uncompressed from the query service) is re-fetched; active-set membership
+	// only changes at epoch boundaries.
+	espressoStakeTableInterval = 2 * time.Minute
 )
+
+// espressoHTTPClient is shared so connections are reused: a fresh client per
+// request would pay a TCP+TLS handshake for every 5s poll of every endpoint.
+var espressoHTTPClient = &http.Client{
+	Timeout: espressoQueryTimeout,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+}
 
 // espressoStatus is a snapshot of the validator node's Status API.
 type espressoStatus struct {
@@ -92,9 +120,8 @@ type espressoStakeTable struct {
 // espressoRawGET performs a GET and returns the status code plus the body. A
 // non-2xx response is not an error at this level: the Status API path moved
 // between releases (/status/* vs /v1/status/*) and the caller falls back.
-func espressoRawGET(url string, timeout time.Duration) (int, []byte, error) {
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Get(url)
+func espressoRawGET(url string) (int, []byte, error) {
+	resp, err := espressoHTTPClient.Get(url)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -108,13 +135,13 @@ func espressoRawGET(url string, timeout time.Duration) (int, []byte, error) {
 
 // espressoNodeGET fetches a Status API path, preferring the /v1-prefixed form
 // served by current releases and falling back to the legacy unprefixed one.
-func espressoNodeGET(base, path string, timeout time.Duration) ([]byte, error) {
+func espressoNodeGET(base, path string) ([]byte, error) {
 	base = strings.TrimRight(base, "/")
-	code, body, err := espressoRawGET(base+"/v1"+path, timeout)
+	code, body, err := espressoRawGET(base + "/v1" + path)
 	if err == nil && code == http.StatusOK {
 		return body, nil
 	}
-	legacyCode, legacyBody, legacyErr := espressoRawGET(base+path, timeout)
+	legacyCode, legacyBody, legacyErr := espressoRawGET(base + path)
 	if legacyErr == nil && legacyCode == http.StatusOK {
 		return legacyBody, nil
 	}
@@ -195,12 +222,12 @@ func espressoParseMetrics(body []byte) *espressoStatus {
 // espressoFetchStatus reads the counters, identity and height from a node's
 // Status API. The block height is a separate endpoint from the metrics.
 func espressoFetchStatus(base string) (*espressoStatus, error) {
-	mb, err := espressoNodeGET(base, "/status/metrics", espressoQueryTimeout)
+	mb, err := espressoNodeGET(base, "/status/metrics")
 	if err != nil {
 		return nil, fmt.Errorf("status metrics: %w", err)
 	}
 	st := espressoParseMetrics(mb)
-	hb, err := espressoNodeGET(base, "/status/block-height", espressoQueryTimeout)
+	hb, err := espressoNodeGET(base, "/status/block-height")
 	if err != nil {
 		return nil, fmt.Errorf("status block-height: %w", err)
 	}
@@ -209,7 +236,7 @@ func espressoFetchStatus(base string) (*espressoStatus, error) {
 		return nil, fmt.Errorf("status block-height %q: %w", strings.TrimSpace(string(hb)), err)
 	}
 	st.Height = h
-	if tb, terr := espressoNodeGET(base, "/status/time-since-last-decide", espressoQueryTimeout); terr == nil {
+	if tb, terr := espressoNodeGET(base, "/status/time-since-last-decide"); terr == nil {
 		if v, perr := strconv.ParseInt(strings.TrimSpace(string(tb)), 10, 64); perr == nil {
 			st.TimeSinceDecide = v
 		}
@@ -219,7 +246,7 @@ func espressoFetchStatus(base string) (*espressoStatus, error) {
 
 // espressoFetchKeys reads the node's registered identity keys.
 func espressoFetchKeys(base string) (*espressoKeys, error) {
-	b, err := espressoNodeGET(base, "/status/keys", espressoQueryTimeout)
+	b, err := espressoNodeGET(base, "/status/keys")
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +264,7 @@ func espressoFetchKeys(base string) (*espressoKeys, error) {
 // node sees it. A 200 with a non-integer body is an error, not a height.
 func espressoFetchBlockHeight(base string) (int64, error) {
 	base = strings.TrimRight(base, "/")
-	code, body, err := espressoRawGET(base+"/v1/status/block-height", espressoQueryTimeout)
+	code, body, err := espressoRawGET(base + "/v1/status/block-height")
 	if err != nil {
 		return 0, err
 	}
@@ -254,7 +281,7 @@ func espressoFetchBlockHeight(base string) (int64, error) {
 // espressoFetchStakeTable reads the current epoch's active set.
 func espressoFetchStakeTable(base string) (*espressoStakeTable, error) {
 	base = strings.TrimRight(base, "/")
-	code, body, err := espressoRawGET(base+"/v1/node/stake-table/current", espressoQueryTimeout)
+	code, body, err := espressoRawGET(base + "/v1/node/stake-table/current")
 	if err != nil {
 		return nil, err
 	}
@@ -314,21 +341,34 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 		} else if first {
 			l(fmt.Sprintf("⚠️ %s could not read espresso node keys from %s: %s", cc.ChainId, cc.EspressoNodeURL, err))
 		}
-		if st, err := espressoFetchStatus(cc.EspressoNodeURL); err == nil {
-			nodeMoniker = st.Moniker
-			nodeVersion = st.Version
-			if nodeKey == "" {
-				nodeKey = st.StakingKey
-			}
-		}
 	}
 
 	cc.stateMux.RLock()
 	prevMoniker, prevValcons := "", ""
+	cachedMoniker := cc.espressoMoniker
+	epochKnown := cc.espressoEpoch > 0
+	stakeFresh := epochKnown && time.Since(cc.espressoStakeTableAt) < espressoStakeTableInterval
 	if cc.valInfo != nil {
 		prevMoniker, prevValcons = cc.valInfo.Moniker, cc.valInfo.Valcons
 	}
 	cc.stateMux.RUnlock()
+
+	// Metrics (75KB plain, ~10KB gzipped) are only needed here to learn the
+	// moniker/version; the poller keeps them fresh and shares the moniker, so
+	// the once-a-minute health tick must not re-download them.
+	if cc.EspressoNodeURL != "" {
+		if cachedMoniker == "" || first {
+			if st, err := espressoFetchStatus(cc.EspressoNodeURL); err == nil {
+				nodeMoniker = st.Moniker
+				nodeVersion = st.Version
+				if nodeKey == "" {
+					nodeKey = st.StakingKey
+				}
+			}
+		} else {
+			nodeMoniker = cachedMoniker
+		}
+	}
 
 	key := cc.EspressoStakingKey
 	if key == "" {
@@ -355,24 +395,28 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 	}
 
 	// Active set: poll every non-down query node and take the first healthy
-	// stake table (poll-all, same reasoning as GnoGetValInfo).
+	// stake table (poll-all, same reasoning as GnoGetValInfo). The table is 45KB
+	// uncompressed from the public query service and membership only changes at
+	// epoch boundaries, so it is re-read at most every espressoStakeTableInterval.
 	var st *espressoStakeTable
 	var lastErr error
-	for _, n := range cc.Nodes {
-		cc.stateMux.RLock()
-		down, url := n.down, n.Url
-		cc.stateMux.RUnlock()
-		if down {
-			continue
+	if !stakeFresh {
+		for _, n := range cc.Nodes {
+			cc.stateMux.RLock()
+			down, url := n.down, n.Url
+			cc.stateMux.RUnlock()
+			if down {
+				continue
+			}
+			tbl, err := espressoFetchStakeTable(url)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			st = tbl
+			lastErr = nil
+			break
 		}
-		tbl, err := espressoFetchStakeTable(url)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		st = tbl
-		lastErr = nil
-		break
 	}
 
 	cc.stateMux.Lock()
@@ -399,6 +443,12 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 		}
 	} else if lastErr != nil && first {
 		l(fmt.Sprintf("⚠️ %s could not read the active stake table: %s", cc.ChainId, lastErr))
+	}
+	if st != nil {
+		cc.espressoStakeTableAt = time.Now()
+	}
+	if moniker != "" && moniker != "not connected" {
+		cc.espressoMoniker = moniker
 	}
 
 	cc.espressoKey = key
@@ -450,8 +500,17 @@ func (cc *ChainConfig) espressoNewRpc() error {
 		}
 	}
 	if working == 0 {
+		// Mirror gnoNewRpc: without this flag watch()'s AlertIfNoServers branch
+		// never fires for an espresso chain.
+		cc.stateMux.Lock()
+		cc.noNodes = true
+		cc.lastError = "no usable query endpoints available for " + cc.ChainId
+		cc.stateMux.Unlock()
 		return errors.New("no working Espresso query endpoints")
 	}
+	cc.stateMux.Lock()
+	cc.noNodes = false
+	cc.stateMux.Unlock()
 	return nil
 }
 
@@ -525,11 +584,17 @@ func (cc *ChainConfig) espressoMonitorHealth(ctx context.Context, chainName stri
 						nodeLagCheck(cc, cc.espressoNode, headH-st.Height)
 					}
 					cc.stateMux.Lock()
-					lag := st.CurrentView - st.LastVotedView
-					if lag < 0 {
-						lag = 0
+					// An unserved metrics payload (status module not registered yet)
+					// must not reset the lag to 0: that would falsely resolve a
+					// "not voting" warning while the node is still stuck.
+					if st.CurrentView > 0 {
+						cc.espressoMetricsValid = true
+						lag := st.CurrentView - st.LastVotedView
+						if lag < 0 {
+							lag = 0
+						}
+						cc.espressoVoteLag = lag
 					}
-					cc.espressoVoteLag = lag
 					if cc.espressoNode.down {
 						cc.espressoNode.lastMsg = ""
 						cc.espressoNode.wasDown = true

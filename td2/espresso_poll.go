@@ -5,14 +5,27 @@ import (
 	"time"
 )
 
-// espressoPushGrid prepends a leader-duty outcome to the dashboard block grid.
-// The grid holds the most recent duty slots (newest first), which is the same
-// meaning it has for cosmos/gno: did the validator do its job for that slot.
-func (cc *ChainConfig) espressoPushGrid(cell int) {
-	if len(cc.blocksResults) == 0 {
+// espressoPrependGrid inserts one tick's new cells at the front of the grid,
+// newest first, matching per-cell prepends without allocating a slice per cell
+// (a 512-cell catch-up would otherwise allocate ~2MB and copy 262k ints).
+func (cc *ChainConfig) espressoPrependGrid(cells []int) {
+	n := len(cc.blocksResults)
+	if n == 0 || len(cells) == 0 {
 		return
 	}
-	cc.blocksResults = append([]int{cell}, cc.blocksResults[:len(cc.blocksResults)-1]...)
+	if len(cells) >= n {
+		tail := cells[len(cells)-n:]
+		for i := 0; i < n; i++ {
+			cc.blocksResults[i] = tail[n-1-i]
+		}
+		return
+	}
+	// Shift the old cells right by len(cells) (overlapping copy is safe), then
+	// write the new ones reversed into the freed front.
+	copy(cc.blocksResults[len(cells):], cc.blocksResults[:n-len(cells)])
+	for i, c := range cells {
+		cc.blocksResults[len(cells)-1-i] = c
+	}
 }
 
 // EspressoPollRun replaces the cosmos websocket / gno commit poller for Espresso
@@ -41,8 +54,9 @@ func (cc *ChainConfig) EspressoPollRun() {
 	}
 	cc.stateMux.Unlock()
 
-	duties := cc.EspressoNodeURL != ""
-	if duties {
+	if cc.EspressoNodeURL == "" {
+		l(fmt.Sprintf("⚠️ %-12s no espresso_node_url: chain liveness only, leader duties are not tracked", cc.ChainId))
+	} else {
 		cc.stateMux.RLock()
 		key := cc.espressoKey
 		cc.stateMux.RUnlock()
@@ -50,17 +64,18 @@ func (cc *ChainConfig) EspressoPollRun() {
 			key = cc.EspressoStakingKey
 		}
 		if key == "" {
-			l(fmt.Sprintf("🛑 %-12s no BLS staking key; leader-duty monitoring inactive", cc.ChainId))
-			duties = false
+			// Not fatal: the health tick resolves the key from /v1/status/keys and
+			// a later tick starts duty polling. Latching this off would disable
+			// duty monitoring for the whole process if the node was briefly down
+			// when the poller started.
+			l(fmt.Sprintf("⚠️ %-12s no BLS staking key yet; leader-duty polling starts once the node answers /v1/status/keys", cc.ChainId))
 		} else {
 			l(fmt.Sprintf("⚙️ %-12s polling %d query node(s) and node %s for leader duties", cc.ChainId, len(cc.Nodes), cc.EspressoNodeURL))
 		}
 	}
-	if !duties && cc.EspressoNodeURL == "" {
-		l(fmt.Sprintf("⚠️ %-12s no espresso_node_url: chain liveness only, leader duties are not tracked", cc.ChainId))
-	}
 
 	noBlockSince := time.Now()
+	tickN := 0
 	tick := time.NewTicker(espressoPollInterval)
 	defer tick.Stop()
 
@@ -69,6 +84,7 @@ func (cc *ChainConfig) EspressoPollRun() {
 		case <-td.ctx.Done():
 			return
 		case <-tick.C:
+			tickN++
 			// Chain head: poll-all, highest height wins.
 			head := int64(-1)
 			for _, n := range cc.Nodes {
@@ -89,8 +105,20 @@ func (cc *ChainConfig) EspressoPollRun() {
 
 			var st *espressoStatus
 			var nodeErr error
-			if duties {
+			cc.stateMux.RLock()
+			key := cc.espressoKey
+			cc.stateMux.RUnlock()
+			if key == "" {
+				key = cc.EspressoStakingKey
+			}
+			duties := cc.EspressoNodeURL != "" && key != ""
+			if duties && tickN%espressoMetricsEveryTicks == 1 {
 				st, nodeErr = espressoFetchStatus(cc.EspressoNodeURL)
+				if st != nil && st.Moniker != "" {
+					cc.stateMux.Lock()
+					cc.espressoMoniker = st.Moniker
+					cc.stateMux.Unlock()
+				}
 			}
 
 			var (
@@ -102,6 +130,19 @@ func (cc *ChainConfig) EspressoPollRun() {
 			)
 
 			cc.stateMux.Lock()
+
+			// A served metrics snapshot refreshes the vote-lag signal even before
+			// the first leader duty (Assigned==0): gating this on the duty
+			// counters would make "not voting" dead until the validator happens to
+			// be assigned a slot (hours at a small stake share).
+			if st != nil && st.CurrentView > 0 {
+				cc.espressoMetricsValid = true
+				lag := st.CurrentView - st.LastVotedView
+				if lag < 0 {
+					lag = 0
+				}
+				cc.espressoVoteLag = lag
+			}
 
 			// Leader-duty accounting from the node counters.
 			if st != nil && cc.valInfo != nil && (st.Assigned > 0 || st.Missed > 0) {
@@ -126,13 +167,18 @@ func (cc *ChainConfig) EspressoPollRun() {
 					if dMissed < 0 {
 						dMissed = 0
 					}
-					if dMissed > dAssigned {
-						dMissed = dAssigned
-					}
+					// The leader-duty histogram for an abandoned view is observed
+					// one view after the timeout counter, so a genuine miss can
+					// briefly lead the assigned count. Clamp only the success side:
+					// capping dMissed at dAssigned and then advancing the baseline
+					// would drop that miss forever.
 					successes := dAssigned - dMissed
+					if successes < 0 {
+						successes = 0
+					}
 					cc.espressoAssignedTotal = st.Assigned
 					cc.espressoMissedTotal = st.Missed
-					if dAssigned > 0 {
+					if dAssigned > 0 || dMissed > 0 {
 						events++
 						cc.espressoEpochAssigned += dAssigned
 						cc.statTotalProps += float64(successes)
@@ -150,22 +196,31 @@ func (cc *ChainConfig) EspressoPollRun() {
 						} else if successes > 0 {
 							cc.statConsecutiveMiss = 0
 						}
+						if cc.espressoEpochAssigned < cc.espressoEpochMissed {
+							// Miss-led sample: keep the displayed tally sane until the
+							// lagging assigned counter catches up.
+							cc.espressoEpochAssigned = cc.espressoEpochMissed
+						}
+						proposals := cc.espressoEpochAssigned - cc.espressoEpochMissed
+						if proposals < 0 {
+							proposals = 0
+						}
 
 						// Sliding duty window (real counts, so the dashboard uptime
 						// % and percentage_missed are exact over the window).
-						pushTotal := dAssigned
-						if pushTotal > int64(windowSize) {
-							pushTotal = int64(windowSize)
+						remaining := int64(windowSize)
+						missPush := dMissed
+						if missPush > remaining {
+							missPush = remaining
 						}
-						pushMissed := dMissed
-						if pushMissed > pushTotal {
-							pushMissed = pushTotal
+						okPush := successes
+						if okPush > remaining-missPush {
+							okPush = remaining - missPush
 						}
-						pushOK := pushTotal - pushMissed
-						for i := int64(0); i < pushMissed; i++ {
+						for i := int64(0); i < missPush; i++ {
 							cc.espressoWin.Push(true)
 						}
-						for i := int64(0); i < pushOK; i++ {
+						for i := int64(0); i < okPush; i++ {
 							cc.espressoWin.Push(false)
 						}
 						cc.valInfo.Missed = int64(cc.espressoWin.Missed())
@@ -186,7 +241,7 @@ func (cc *ChainConfig) EspressoPollRun() {
 						if dMissed > 0 && cc.valInfo.Bonded {
 							warn := fmt.Sprintf("❌ %s missed leader duty on %s (epoch %d, %d this epoch, proposals %d/%d)",
 								cc.valInfo.Moniker, cc.ChainId, cc.espressoEpoch, cc.espressoEpochMissed,
-								cc.espressoEpochAssigned-cc.espressoEpochMissed, cc.espressoEpochAssigned)
+								proposals, cc.espressoEpochAssigned)
 							cc.lastError = time.Now().UTC().String() + " " + warn
 							logMsgs = append(logMsgs, warn)
 						} else if successes > 0 && cc.valInfo.Bonded {
@@ -194,19 +249,10 @@ func (cc *ChainConfig) EspressoPollRun() {
 							// one line per duty makes the poller's progress visible in
 							// the journal (the dashboard grid alone moves too slowly).
 							logMsgs = append(logMsgs, fmt.Sprintf("✅ %s proposed leader duty on %s (epoch %d, proposals %d/%d)",
-								cc.valInfo.Moniker, cc.ChainId, cc.espressoEpoch,
-								cc.espressoEpochAssigned-cc.espressoEpochMissed, cc.espressoEpochAssigned))
+								cc.valInfo.Moniker, cc.ChainId, cc.espressoEpoch, proposals, cc.espressoEpochAssigned))
 						}
 					}
 				}
-			}
-
-			if st != nil {
-				lag := st.CurrentView - st.LastVotedView
-				if lag < 0 {
-					lag = 0
-				}
-				cc.espressoVoteLag = lag
 			}
 
 			// Chain height and the stall clock. A head below the last processed
@@ -247,9 +293,7 @@ func (cc *ChainConfig) EspressoPollRun() {
 			// Missed duties are prepended last so they land in front of the block
 			// cells from the same tick and stay visible for a full grid cycle.
 			cells = append(cells, missCells...)
-			for _, c := range cells {
-				cc.espressoPushGrid(c)
-			}
+			cc.espressoPrependGrid(cells)
 			height := cc.lastBlockNum
 			moniker := cc.valInfo.Moniker
 			status := cc.statusUpdate()

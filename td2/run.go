@@ -196,19 +196,29 @@ func snapshotStateOf(c *Config) ([]byte, error) {
 	espressoCounters := make(map[string]*espressoSavedStats)
 	for k, v := range chains {
 		v.stateMux.RLock()
-		if v.Type == "espresso" && v.valInfo != nil {
-			es := &espressoSavedStats{
-				TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
-				TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
-				CountersValid: v.espressoCountersValid,
-				AssignedTotal: v.espressoAssignedTotal, MissedTotal: v.espressoMissedTotal,
-				Epoch: v.espressoEpoch, EpochAssigned: v.espressoEpochAssigned, EpochMissed: v.espressoEpochMissed,
-				LastBlockNum: v.lastBlockNum, LastBlockTime: v.lastBlockTime,
+		if v.Type == "espresso" {
+			// The validator's own Status API is not in cc.Nodes; persist its down
+			// state under a sentinel key so a restart does not resolve the alarm.
+			if v.espressoNode != nil && v.espressoNode.down && !v.espressoNode.downSince.IsZero() {
+				if nodesDown[k] == nil {
+					nodesDown[k] = make(map[string]time.Time)
+				}
+				nodesDown[k]["espresso-node"] = v.espressoNode.downSince
 			}
-			if v.espressoWin != nil {
-				es.Duties = v.espressoWin.Entries()
+			if v.valInfo != nil {
+				es := &espressoSavedStats{
+					TotalSigns: v.statTotalSigns, TotalProps: v.statTotalProps,
+					TotalMiss: v.statTotalMiss, ConsecutiveMiss: v.statConsecutiveMiss,
+					CountersValid: v.espressoCountersValid,
+					AssignedTotal: v.espressoAssignedTotal, MissedTotal: v.espressoMissedTotal,
+					Epoch: v.espressoEpoch, EpochAssigned: v.espressoEpochAssigned, EpochMissed: v.espressoEpochMissed,
+					LastBlockNum: v.lastBlockNum, LastBlockTime: v.lastBlockTime,
+				}
+				if v.espressoWin != nil {
+					es.Duties = v.espressoWin.Entries()
+				}
+				espressoCounters[k] = es
 			}
-			espressoCounters[k] = es
 		}
 		v.stateMux.RUnlock()
 	}

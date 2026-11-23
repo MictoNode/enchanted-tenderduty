@@ -166,7 +166,17 @@ type ChainConfig struct {
 	espressoAssignedTotal  int64       // last observed consensus_view_duration_as_leader_count
 	espressoMissedTotal    int64       // last observed consensus_number_of_timeouts_as_leader
 	espressoVoteLag        int64       // current_view - last_voted_view at the last health tick
+	espressoMetricsValid   bool        // a served metrics snapshot was parsed (vote lag is meaningful even with zero duties)
 	espressoBondMissStreak int         // consecutive definitive not-in-active-set stake table answers
+	espressoMoniker        string      // node identity label, shared from the poller to avoid refetching metrics
+	espressoStakeTableAt   time.Time   // last successful stake table fetch (rate-limits the 45KB payload)
+
+	// espressoNodeDownSince/espressoNodeWasDown carry a persisted validator-node
+	// failure from loadConfig (where espressoNode does not exist yet) into
+	// validateConfig, which creates the NodeConfig and applies the state. Without
+	// it a restart resolves the node-down alarm while the node is still down.
+	espressoNodeDownSince time.Time
+	espressoNodeWasDown   bool
 
 	statTotalSigns      float64
 	statTotalProps      float64
@@ -500,7 +510,19 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 				problems = append(problems, fmt.Sprintf("warn: %20s espresso chain has no espresso_node_url; leader duties (missed proposals) cannot be tracked, only chain liveness", k))
 			} else {
 				v.EspressoNodeURL = strings.TrimRight(v.EspressoNodeURL, "/")
-				v.espressoNode = &NodeConfig{Url: v.EspressoNodeURL, AlertIfDown: true}
+				if v.espressoNode == nil {
+					v.espressoNode = &NodeConfig{Url: v.EspressoNodeURL, AlertIfDown: true}
+				} else {
+					v.espressoNode.Url = v.EspressoNodeURL
+				}
+				// Apply a node-down state restored from the state file: without it
+				// every restart resolves "validator node is not responding" while
+				// the node is still down, then re-fires after another full delay.
+				if !v.espressoNodeDownSince.IsZero() {
+					v.espressoNode.down = true
+					v.espressoNode.wasDown = v.espressoNodeWasDown
+					v.espressoNode.downSince = v.espressoNodeDownSince
+				}
 			}
 			if len(v.Nodes) == 0 {
 				problems = append(problems, fmt.Sprintf("warn: %20s espresso chain has no query service URLs under nodes", k))
@@ -909,6 +931,13 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 			for nodeUrl := range v {
 				if !v[nodeUrl].IsZero() {
 					if c.Chains[k] != nil {
+						if nodeUrl == "espresso-node" && c.Chains[k].Type == "espresso" {
+							// The validator's own Status API is restored by
+							// validateConfig, which creates the NodeConfig.
+							c.Chains[k].espressoNodeDownSince = v[nodeUrl]
+							c.Chains[k].espressoNodeWasDown = true
+							continue
+						}
 						for j := range c.Chains[k].Nodes {
 							if c.Chains[k].Nodes[j].Url == nodeUrl {
 								c.Chains[k].Nodes[j].down = true

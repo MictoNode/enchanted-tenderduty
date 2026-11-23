@@ -109,6 +109,15 @@ func shortenEspressoPollTimers(t *testing.T, interval, idle time.Duration) {
 	t.Cleanup(func() { espressoPollInterval, espressoPollIdleExit = oi, oe })
 }
 
+// allowEveryStakeTableFetch disables the production rate limit so a test can
+// drive two consecutive stake-table answers.
+func allowEveryStakeTableFetch(t *testing.T) {
+	t.Helper()
+	orig := espressoStakeTableInterval
+	espressoStakeTableInterval = 0
+	t.Cleanup(func() { espressoStakeTableInterval = orig })
+}
+
 func TestEspressoParseMetrics(t *testing.T) {
 	st := espressoParseMetrics([]byte(espressoMetricsFixture(44803, 15, 34667904, 34667903, espressoTestKey, "MictoNode")))
 	if st.Assigned != 44803 || st.Missed != 15 {
@@ -377,6 +386,7 @@ func TestEspressoPollChainOnlyWithoutNodeURL(t *testing.T) {
 // /v1/status/keys (fallback: the metrics label) and Bonded from the stake table,
 // with a two-tick debounce before a not-in-set verdict flips.
 func TestEspressoGetValInfoStakeTableAndKeyDiscovery(t *testing.T) {
+	allowEveryStakeTableFetch(t)
 	m := &espressoMock{current: 10, voted: 9, height: 1}
 	srv := httptest.NewServer(http.HandlerFunc(m.serve))
 	defer srv.Close()
@@ -604,4 +614,192 @@ func TestValidateConfigPublishesRestoredDutyWindow(t *testing.T) {
 	if cc.valInfo.Window != 3 || cc.valInfo.Missed != 1 {
 		t.Fatalf("restored window not published: missed=%d window=%d, want 1/3", cc.valInfo.Missed, cc.valInfo.Window)
 	}
+}
+
+// TestEspressoPollVoteLagWithoutDuties: a validator with no leader duty yet
+// (Assigned==0) must still expose the vote-lag signal — gating "not voting" on
+// the duty counters would leave it dead for hours at a small stake share.
+func TestEspressoPollVoteLagWithoutDuties(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+
+	m := &espressoMock{current: 1000, voted: 890, height: 500}
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.lastBlockNum = 500
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		ok := cc.espressoMetricsValid && cc.espressoVoteLag == 110
+		valid := cc.espressoCountersValid
+		cc.stateMux.RUnlock()
+		if ok {
+			if valid {
+				t.Fatal("duty baseline seeded without any assigned duty")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("vote lag never recorded without duties (valid=%v lag=%d)", cc.espressoMetricsValid, cc.espressoVoteLag)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+// TestEspressoPollKeepsMissWhenTimeoutLeadsAssigned: the leader-duty histogram
+// for an abandoned view is observed one view after the timeout counter, so a
+// real miss can lead the assigned count by one. Clamping it away would lose the
+// miss forever once the baseline advances.
+func TestEspressoPollKeepsMissWhenTimeoutLeadsAssigned(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+
+	m := &espressoMock{current: 1000, voted: 999, height: 500}
+	m.set(10, 0, 500)
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.lastBlockNum = 500
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	waitCond := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(4 * time.Second)
+		for {
+			cc.stateMux.RLock()
+			ok := cond()
+			cc.stateMux.RUnlock()
+			if ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				cancel()
+				<-done
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	waitCond("baseline", func() bool { return cc.espressoCountersValid && cc.espressoAssignedTotal == 10 })
+
+	// Timeout counter advanced, assigned count not yet: a real miss.
+	m.set(10, 1, 500)
+	waitCond("miss-led sample", func() bool { return cc.espressoMissedTotal == 1 })
+
+	cancel()
+	<-done
+
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
+	if cc.espressoWin.Missed() != 1 || cc.espressoWin.Window() != 1 {
+		t.Fatalf("window: missed=%d window=%d, want 1/1", cc.espressoWin.Missed(), cc.espressoWin.Window())
+	}
+	if cc.statTotalMiss != 1 || cc.statConsecutiveMiss != 1 {
+		t.Fatalf("counters: totalMiss=%v consecutive=%v, want 1/1", cc.statTotalMiss, cc.statConsecutiveMiss)
+	}
+	if cc.valInfo.Missed != 1 || cc.valInfo.Window != 1 {
+		t.Fatalf("valInfo window: %+v", cc.valInfo)
+	}
+	if cc.espressoEpochAssigned < cc.espressoEpochMissed {
+		t.Fatalf("epoch tally went negative: assigned=%d missed=%d", cc.espressoEpochAssigned, cc.espressoEpochMissed)
+	}
+	if cc.blocksResults[0] != int(Statusmissed) {
+		t.Fatalf("grid[0]=%d, want missed", cc.blocksResults[0])
+	}
+}
+
+// TestEspressoPrependGridOrder: the batched prepend must produce exactly the
+// same newest-first order as one prepend per cell.
+func TestEspressoPrependGridOrder(t *testing.T) {
+	cc := &ChainConfig{blocksResults: []int{-1, -1, -1, -1}}
+	cc.espressoPrependGrid([]int{10, 11})
+	want := []int{11, 10, -1, -1}
+	for i := range want {
+		if cc.blocksResults[i] != want[i] {
+			t.Fatalf("after 2 cells: %v, want %v", cc.blocksResults, want)
+		}
+	}
+	cc.espressoPrependGrid([]int{20, 21, 22, 23, 24})
+	want = []int{24, 23, 22, 21}
+	for i := range want {
+		if cc.blocksResults[i] != want[i] {
+			t.Fatalf("after overflow: %v, want %v", cc.blocksResults, want)
+		}
+	}
+}
+
+// TestEspressoPollStartsDutiesWhenKeyResolvesLater: the duty switch must be
+// evaluated per tick. A poller that started while the node was unreachable (key
+// not yet resolved) used to latch duty monitoring off for the whole process.
+func TestEspressoPollStartsDutiesWhenKeyResolvesLater(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+
+	m := &espressoMock{current: 1000, voted: 999, height: 500}
+	m.set(10, 0, 500)
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.EspressoStakingKey = ""
+	cc.espressoKey = ""
+	cc.lastBlockNum = 500
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	// Let the poller run a few ticks without a key: no duty baseline may appear.
+	time.Sleep(40 * time.Millisecond)
+	cc.stateMux.RLock()
+	validBefore := cc.espressoCountersValid
+	cc.stateMux.RUnlock()
+	if validBefore {
+		cancel()
+		<-done
+		t.Fatal("duty baseline seeded while the key was unknown")
+	}
+
+	// The health path resolves the key; the next tick must start duty polling.
+	if err := cc.EspressoGetValInfo(false); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("GetValInfo: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		ok := cc.espressoCountersValid && cc.espressoAssignedTotal == 10
+		cc.stateMux.RUnlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("duty polling never started after the key resolved")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
 }
