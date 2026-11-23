@@ -855,3 +855,40 @@ func TestEspressoGetValInfoDetectsForeignNode(t *testing.T) {
 		t.Fatalf("grid painted as signed while duty monitoring is disabled: %d", cc.blocksResults[0])
 	}
 }
+
+// TestEspressoStakeTableDecafShape pins the Decaf testnet response shape. Decaf
+// entries carry state_ver_key and connect_info next to the stake table entry,
+// stake amounts are hex quantities and the epoch is a four-digit counter; none
+// of that may break parsing or key membership (the testnet support claim rests
+// on this response being accepted unchanged).
+func TestEspressoStakeTableDecafShape(t *testing.T) {
+	const (
+		decafKey = "BLS_VER_KEY~sec0luILbfqRgaWyccWTjyDEUuHm6KIBcD6WkpP4DQuSa3TOeQbj4uuSKTkzr-Vv3xIYjlZmVprWKAq7A3a8IOx9zX5KeQBHsn5hAyIXVdgnSGzjQXVugzhPhHa3A72sV-nKydqZGtOIGk9_91nwVdkuqrTIHAKYedfbPQi7yJhX6"
+		body     = `{"epoch":8126,"stake_table":[{"stake_table_entry":{"stake_key":"` + decafKey + `","stake_amount":"0xd8d726b7177a800000"},"state_ver_key":"SCHNORR_VER_KEY~WET-NBLBvZAR5BFysYPvYn_ZxRPI8_Q-NxjH9n7tDx3tISmYpL9UGPxeEQ_HtCVLUjwB7YQF7Euul1enUbbZDfk","connect_info":{"x25519_key":"AcvxPrqMCFsQT9jhTcDbN7s2CAuN4c8U5YyXy2ewbn4d","p2p_addr":"15.235.180.161:9977"}}]}`
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/node/stake-table/current" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	st, err := espressoFetchStakeTable(srv.URL)
+	if err != nil {
+		t.Fatalf("decaf stake table: %v", err)
+	}
+	if st.Epoch != 8126 {
+		t.Fatalf("epoch = %d, want 8126", st.Epoch)
+	}
+	if len(st.StakeTable) != 1 {
+		t.Fatalf("entries = %d, want 1", len(st.StakeTable))
+	}
+	if !espressoStakeTableHasKey(st, decafKey) {
+		t.Fatal("decaf key not found in its own stake table")
+	}
+	if espressoStakeTableHasKey(st, espressoTestKey) {
+		t.Fatal("membership matched an unrelated BLS key")
+	}
+}

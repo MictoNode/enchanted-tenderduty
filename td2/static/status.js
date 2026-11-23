@@ -19,12 +19,12 @@ function showSkeleton() {
     let html = '';
     for (let i = 0; i < 4; i++) {
         html += '<tr class="td-skeleton-row">'
-            + '<td></td>'
-            + '<td><span class="td-skeleton" style="width:55%"></span></td>'
-            + '<td></td>'
-            + '<td><span class="td-skeleton" style="width:40%"></span></td>'
-            + '<td><span class="td-skeleton" style="width:50%"></span></td>'
-            + '<td></td>'
+            + '<td class="col-alert"></td>'
+            + '<td class="col-chain"><span class="td-skeleton" style="width:55%"></span></td>'
+            + '<td class="col-status"></td>'
+            + '<td class="col-height"><span class="td-skeleton" style="width:40%"></span></td>'
+            + '<td class="col-uptime"><span class="td-skeleton" style="width:50%"></span></td>'
+            + '<td class="col-nodes"></td>'
             + '</tr>';
     }
     tbody.innerHTML = html;
@@ -127,7 +127,7 @@ function updateTableStable(chains) {
 
     // Handle empty state
     if (chains.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted);">No chains found.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--text-muted);">No chains found.</td></tr>';
         return;
     }
 
@@ -175,14 +175,14 @@ function updateTableStable(chains) {
             row = document.createElement('tr');
             row.setAttribute('data-chain-id', chainId);
             row.innerHTML = `
-                <td class="cell-alert" data-alert="${hasAlert ? '1' : '0'}">${alertHtml}</td>
-                <td>
+                <td class="cell-alert col-alert" data-alert="${hasAlert ? '1' : '0'}">${alertHtml}</td>
+                <td class="col-chain">
                     <div class="td-chain-name">${escapeHtml(chain.name)}</div>
                     <div class="td-chain-id">${escapeHtml(chain.chain_id)}</div>
                 </td>
-                <td style="text-align:center;"><span class="td-badge td-badge-${statusClass}" data-status="${statusIcon}"><i data-lucide="${statusIcon}"></i>${statusText}</span></td>
-                <td><span class="td-height">${heightStr}</span></td>
-                <td>
+                <td class="col-status" style="text-align:center;"><span class="td-badge td-badge-${statusClass}" data-status="${statusIcon}"><i data-lucide="${statusIcon}"></i>${statusText}</span></td>
+                <td class="col-height"><span class="td-height">${heightStr}</span></td>
+                <td class="col-uptime">
                     <div class="td-uptime">
                         <span class="td-uptime-percent" style="${uptimeColor}">${uptimePct}</span>
                         <span class="td-uptime-ratio">${chain.missed} / ${chain.window}</span>
@@ -190,7 +190,7 @@ function updateTableStable(chains) {
                         <span class="td-uptime-bar"><span class="td-uptime-bar-fill" style="width:${barWidth}%;background:${barColor};"></span></span>
                     </div>
                 </td>
-                <td><div class="td-nodes"><div class="td-node-dots">${dotsHtml}</div> ${healthy}/${total}</div></td>
+                <td class="col-nodes"><div class="td-nodes"><div class="td-node-dots">${dotsHtml}</div> ${healthy}/${total}</div></td>
             `;
             row.classList.toggle('has-alert', hasAlert);
             tbody.appendChild(row);

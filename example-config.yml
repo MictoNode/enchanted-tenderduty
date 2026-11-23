@@ -248,3 +248,40 @@ chains:
       # head detection takes the highest height, so one stale service cannot
       # freeze monitoring.
 
+  # ---- Espresso validator on the Decaf testnet ----
+  # Identical provider and node Status API; only the L1 (Ethereum Sepolia),
+  # stake-table contract and query service differ. Decaf epochs are short
+  # (~3,000 blocks ≈ 35–40 min), so the epoch tally resets often — rely on
+  # consecutive_missed and the duty-window percentage. Decaf ESP is not
+  # publicly distributed: register on Sepolia, then request a delegation in
+  # #decaf-node-ops on the Espresso Discord.
+  "Espresso-Decaf":
+    chain_id: espresso-decaf-testnet   # cosmetic; identity is the BLS key
+    network: testnet
+    type: espresso
+    espresso_node_url: https://espresso-node.example.com:28181
+    # espresso_staking_key: BLS_VER_KEY~...   # blank = auto-discover from the node
+    espresso_duty_window: 1000
+    espresso_vote_lag_views: 100
+    alerts:
+      stalled_enabled: yes
+      stalled_minutes: 3
+      consecutive_enabled: yes
+      consecutive_missed: 1
+      consecutive_priority: critical
+      percentage_enabled: yes
+      percentage_missed: 1
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+      discord:
+        enabled: yes
+        webhook: ""
+      telegram:
+        enabled: yes
+        api_key: ""
+        channel: ""
+    nodes:
+      - url: https://query.decaf.testnet.espresso.network
+        alert_if_down: yes
+

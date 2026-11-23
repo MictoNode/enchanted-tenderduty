@@ -16,7 +16,7 @@ validators, unreachable nodes, and validators that stopped voting.
 - **Tri-provider monitoring** in one binary:
   - `cosmos` (default) — Cosmos-SDK / Evmos chains via websocket + staking/slashing queries.
   - `gnoland` — gno.land / TM2 chains via HTTP polling (`/block`, `/validators`, `vm/qeval`), for public nodes that expose no websocket.
-  - `espresso` — Espresso (HotShot) validators: leader duties assigned/missed are read from the validator's own Status API, so a missed proposal alerts within seconds (the public query service only exposes per-epoch rates).
+  - `espresso` — Espresso (HotShot) validators on **mainnet or the Decaf testnet**: leader duties assigned/missed are read from the validator's own Status API, so a missed proposal alerts within seconds (the public query service only exposes per-epoch rates).
 - **Alerts** to Discord, Telegram, Slack, PagerDuty, and **Pushover** (emergency priority that breaks through Do Not Disturb).
 - **Web dashboard** — every chain (cosmos, gnoland *and* espresso, testnet *and* mainnet) shows up the same way: bonded/jailed status, missed-block grid (leader duties for espresso), height, active alerts, with mainnet/testnet tabs driven by a per-chain `network` field.
 - **Prometheus exporter** — gauges prefixed `tenderduty_*`.
@@ -287,6 +287,30 @@ chains:
     nodes:                              # query-service endpoints (head, poll-all)
       - url: https://query.main.net.espresso.network
         alert_if_down: yes
+
+  # ---- Espresso validator on the Decaf testnet ----
+  # Same provider, same node image, same Status API; only the L1 (Sepolia),
+  # stake table contract and query service differ. Decaf ESP is not publicly
+  # distributed: register on Sepolia, then ask the Espresso team for a
+  # delegation in #decaf-node-ops.
+  "Espresso-Decaf":
+    chain_id: espresso-decaf-testnet   # cosmetic; identity is the BLS key
+    network: testnet                   # puts the row in the dashboard's testnet tab
+    type: espresso
+    espresso_node_url: https://espresso-node.example.com:28181
+    espresso_duty_window: 1000
+    alerts:
+      consecutive_enabled: yes
+      consecutive_missed: 1
+      consecutive_priority: critical
+      percentage_enabled: yes
+      percentage_missed: 1
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+    nodes:
+      - url: https://query.decaf.testnet.espresso.network
+        alert_if_down: yes
 ```
 
 See `example-config.yml` for the full set of fields (all five sinks with
@@ -321,7 +345,8 @@ per-chain overrides, healthcheck, etc.).
 
 - HotShot has **no per-validator block signature** and the public query service publishes only per-epoch **participation rates** (`/v1/node/participation/proposal/{epoch}`) — no counts, no leader schedule, no DRB. The validator's own Status API is the authoritative source: `consensus_view_duration_as_leader_count` is the number of leader slots assigned to the node and `consensus_number_of_timeouts_as_leader` the ones it failed to propose, so `proposals = assigned - missed`. Verified against public validators: the counter ratio matches the delegation program's published weekly miss rate.
 - **`espresso_node_url` must be your own validator's Status API** (`ESPRESSO_NODE_API_PORT`) — not another operator's node, not the public query service. Both leader-duty counters are **node-local**: they describe the proposals of the node answering them, so pointing this at a foreign node would silently monitor that operator's duties. If `espresso_staking_key` is set and the node reports a different BLS key, tenderduty refuses duty accounting and logs `🛑 ... reports ..., not the configured espresso_staking_key ... point espresso_node_url at YOUR validator`. The endpoint serves plain HTTP — put it behind an HTTPS reverse proxy or allow only the monitoring host through the firewall. The BLS staking key, operator address and node name are discovered from `/v1/status/keys` and the `consensus_node` / `consensus_node_identity_general` metrics.
-- `nodes[]` are **query-service** endpoints, not the validator. Every configured endpoint is asked for the chain head each poll and the highest height wins, so one stale endpoint cannot freeze monitoring or mask a stalled chain (same model as gnoland). The public mainnet query service is `https://query.main.net.espresso.network`.
+- `nodes[]` are **query-service** endpoints, not the validator. Every configured endpoint is asked for the chain head each poll and the highest height wins, so one stale endpoint cannot freeze monitoring or mask a stalled chain (same model as gnoland). Use `https://query.main.net.espresso.network` for mainnet and `https://query.decaf.testnet.espresso.network` for the **Decaf testnet**.
+- **Decaf testnet**: same provider, same `espresso-node` image and Status API as mainnet — only the L1 (Ethereum Sepolia), stake-table contract and query service differ. Set `network: testnet` (dashboard tab) and point `nodes[]` at the Decaf query service; `chain_id` is cosmetic for espresso. Decaf epochs are short (~3,000 blocks ≈ 35–40 min at ~1.4 blocks/s vs ~40k blocks on mainnet), so the per-epoch tally resets often — `consecutive_missed: 1` and the duty-window percentage are the meaningful signals, not the epoch tally. Decaf ESP is not publicly distributed: register the node on Sepolia, then ask the Espresso team for a delegation in `#decaf-node-ops` on Discord. Block explorer: `https://explorer.decaf.testnet.espresso.network`.
 - The dashboard grid is per **block** (green = a block this validator proposed, blue = a decided block while it was voting) and flows at block rate like the cosmos/gno grids; every missed leader duty is inserted as an orange cell in that stream. The counters do not identify the exact block, so a successful duty paints the newest signed cell green (within the ~15s sample window). Uptime % and `missed / window` use the last `espresso_duty_window` **assigned leader duties** (not blocks: at a small stake share 10k blocks contain only ~tens of duties) with real counts, persisted across restarts. Below them the row shows the current epoch tally — `epoch N · M missed / A assigned` — the same numbers the delegation-program bots report.
 - Extra alarms: `validator node ... is not responding` (own Status API down longer than `node_down_alert_minutes`) and `... has not voted ... in N views` (`current_view - last_voted_view` exceeds `espresso_vote_lag_views` while the chain keeps moving — the node lost consensus connectivity).
 - Counter drops mean the node restarted (Prometheus counters are process-lifetime); the baseline is re-seeded instead of reporting a bogus delta. Inactive detection is stake-table membership, debounced over two health ticks (Espresso has no jail).

@@ -23,7 +23,7 @@
     rel="stylesheet">
 
   <!-- Styles -->
-  <link rel="stylesheet" href="css/styles.css?v=11" />
+  <link rel="stylesheet" href="css/styles.css?v=13" />
   <link rel="icon" href="icon-192.png">
 
   <!-- Lucide Icons -->
@@ -87,12 +87,12 @@
       <table class="td-table">
         <thead>
           <tr>
-            <th style="width: 40px;"></th>
-            <th>Chain</th>
-            <th style="text-align: center;">Status</th>
-            <th>Height</th>
-            <th>Uptime</th>
-            <th style="text-align: center;">RPC Nodes</th>
+            <th class="col-alert" style="width: 40px;"></th>
+            <th class="col-chain">Chain</th>
+            <th class="col-status" style="text-align: center;">Status</th>
+            <th class="col-height">Height</th>
+            <th class="col-uptime">Uptime</th>
+            <th class="col-nodes" style="text-align: center;">RPC Nodes</th>
           </tr>
         </thead>
         <tbody id="statusTable"></tbody>
@@ -114,8 +114,8 @@
 
   <!-- Scripts -->
   <script src="./js/lodash.min.js"></script>
-  <script src="grid.js?v=11"></script>
-  <script src="status.js?v=11"></script>
+  <script src="grid.js?v=12"></script>
+  <script src="status.js?v=12"></script>
   <script>
     // Initialize Lucide icons
     lucide.createIcons();

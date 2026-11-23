@@ -1,5 +1,5 @@
 // Node Monitor Service Worker
-const CACHE_NAME = 'node-monitor-v8';
+const CACHE_NAME = 'node-monitor-v9';
 const STATIC_ASSETS = [
     '/',
     '/index.html',

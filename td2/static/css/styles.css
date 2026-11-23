@@ -523,6 +523,17 @@ body {
   .col-nodes {
     display: none;
   }
+
+  /* With the narrow columns hidden, table auto-layout hands the free space to
+     the empty alert cell and pushes the chain name to the right edge. Pin the
+     alert cell to its content width and let the chain column take the rest. */
+  .col-alert {
+    width: 1%;
+  }
+
+  .col-chain {
+    width: auto;
+  }
 }
 
 @media (max-width: 600px) {
