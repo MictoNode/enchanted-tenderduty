@@ -155,7 +155,16 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 type CacheHandler struct{}
 
 func (ch CacheHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Cache-Control", "public, max-age=3600")
+	// Versioned URLs (?v=N) are immutable: the whole point of the version bump
+	// is that the content at that URL never changes, so edges/browsers may pin
+	// it forever. Everything else (index.html, sw.js, icons) must revalidate:
+	// a blanket max-age=3600 previously let Cloudflare keep serving the old
+	// stylesheet for an hour after a deploy, so a shipped fix looked absent.
+	if request.URL.Query().Has("v") {
+		writer.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		writer.Header().Set("Cache-Control", "no-cache")
+	}
 	writer.Header().Set("X-Powered-By", "https://github.com/MictoNode/enchanted-tenderduty")
 	http.FileServer(http.FS(rootDir)).ServeHTTP(writer, request)
 }

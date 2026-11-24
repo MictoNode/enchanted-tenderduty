@@ -1,12 +1,15 @@
 // Node Monitor Service Worker
-const CACHE_NAME = 'node-monitor-v10';
+const CACHE_NAME = 'node-monitor-v11';
 const STATIC_ASSETS = [
     '/',
     '/index.html',
-    '/css/styles.css',
+    // Versioned URLs as referenced by index.html: precaching the bare path can
+    // pick up an hour-old edge copy of the stylesheet, and cache-first then
+    // pins it. Bump these together with index.html.
+    '/css/styles.css?v=15',
     '/js/lodash.min.js',
-    '/grid.js',
-    '/status.js',
+    '/grid.js?v=12',
+    '/status.js?v=12',
     '/icon-192.png',
     '/icon-512.png',
     '/manifest.json'
