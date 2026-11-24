@@ -245,7 +245,10 @@ body {
 
 /* Table Columns Widths */
 .col-alert {
-  width: 50px;
+  /* Percentage, not px: with a px width the empty alert column is handed a
+     large share of the table's spare width by auto layout (236px at 1280),
+     which pushes the chain name far right. 1% pins it to its content. */
+  width: 1%;
   text-align: center;
 }
 
