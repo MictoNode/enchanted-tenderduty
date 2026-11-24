@@ -1,5 +1,5 @@
 // Node Monitor Service Worker
-const CACHE_NAME = 'node-monitor-v9';
+const CACHE_NAME = 'node-monitor-v10';
 const STATIC_ASSETS = [
     '/',
     '/index.html',
@@ -18,7 +18,9 @@ self.addEventListener('install', (event) => {
         caches.open(CACHE_NAME)
             .then((cache) => {
                 console.log('[SW] Caching static assets');
-                return cache.addAll(STATIC_ASSETS);
+                // cache:'reload' bypasses the HTTP cache: a version bump must
+                // ship the current files, not a heuristically-fresh stale copy.
+                return cache.addAll(STATIC_ASSETS.map((url) => new Request(url, { cache: 'reload' })));
             })
             .then(() => self.skipWaiting())
     );

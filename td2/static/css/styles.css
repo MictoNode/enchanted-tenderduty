@@ -519,20 +519,86 @@ body {
     height: auto;
   }
 
-  .col-uptime,
-  .col-nodes {
-    display: none;
+  /* The pinned chain column is a fixed-width block; long chain ids truncate
+     instead of widening the column. */
+  .td-chain-name,
+  .td-chain-id {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@media (max-width: 800px) {
+
+  /* Keep every column on small screens: the table scrolls horizontally
+     instead of dropping details. Hiding columns was the old behaviour and
+     left phones with nothing to scroll to (chain name only). */
+  .td-table-container {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
   }
 
-  /* With the narrow columns hidden, table auto-layout hands the free space to
-     the empty alert cell and pushes the chain name to the right edge. Pin the
-     alert cell to its content width and let the chain column take the rest. */
-  .col-alert {
-    width: 1%;
+  /* Fixed layout keeps the pinned columns at an exact width, so the sticky
+     offsets below line up instead of leaving a sliver of scrolling content
+     between the alert and chain cells. Column widths must sum to 760px. */
+  .td-table {
+    table-layout: fixed;
+    width: 760px;
+    min-width: 760px;
   }
 
-  .col-chain {
-    width: auto;
+  .td-table th.col-alert { width: 40px; }
+  .td-table th.col-chain { width: 160px; }
+  .td-table th.col-status { width: 120px; }
+  .td-table th.col-height { width: 132px; }
+  .td-table th.col-uptime { width: 148px; }
+  .td-table th.col-nodes { width: 160px; }
+
+  /* Pin the alert + chain columns so the row stays identifiable while the
+     detail columns scroll underneath. Sticky cells need an opaque background,
+     hence the hover/alert overrides below (they are translucent otherwise). */
+  .td-table th.col-alert,
+  .td-table td.col-alert,
+  .td-table th.col-chain,
+  .td-table td.col-chain {
+    position: sticky;
+    z-index: 2;
+    background: var(--bg-primary);
+  }
+
+  .td-table th.col-alert,
+  .td-table td.col-alert {
+    left: 0;
+    padding-left: 12px;
+    padding-right: 0;
+  }
+
+  .td-table th.col-chain,
+  .td-table td.col-chain {
+    left: 40px;
+    border-right: 1px solid var(--glass-border);
+  }
+
+  .td-table tr:hover td.col-alert,
+  .td-table tr:hover td.col-chain {
+    background: linear-gradient(rgba(59, 130, 246, 0.03), rgba(59, 130, 246, 0.03)), var(--bg-primary);
+  }
+
+  .td-table tr.has-alert td.col-alert,
+  .td-table tr.has-alert td.col-chain {
+    background: linear-gradient(rgba(239, 68, 68, 0.05), rgba(239, 68, 68, 0.05)), var(--bg-primary);
+  }
+
+  .td-table tr.has-alert:hover td.col-alert,
+  .td-table tr.has-alert:hover td.col-chain {
+    background: linear-gradient(rgba(239, 68, 68, 0.08), rgba(239, 68, 68, 0.08)), var(--bg-primary);
+  }
+
+  .td-skeleton-row td.col-alert,
+  .td-skeleton-row td.col-chain {
+    background: var(--bg-primary);
   }
 }
 
@@ -547,11 +613,6 @@ body {
     justify-content: center;
   }
 
-  .col-height,
-  .col-status {
-    display: none;
-  }
-
   .td-table th {
     font-size: 0.65rem;
   }
@@ -560,16 +621,16 @@ body {
     font-size: 0.9rem;
   }
 
+  /* Narrower pinned block leaves more room for the scrolling details. */
+  .td-table {
+    width: 740px;
+    min-width: 740px;
+  }
+
+  .td-table th.col-chain { width: 140px; }
+
   .td-container {
     padding: 10px;
-  }
-
-  .td-table-container {
-    overflow-x: auto;
-  }
-
-  .td-table {
-    min-width: 100%;
   }
 
   /* Hide grid explicitly */
