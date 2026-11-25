@@ -30,6 +30,11 @@ prometheus_listen_port: 28686
 # Each sink has its own `enabled` flag. A notification is delivered when the
 # global sink is enabled AND the chain-level sink (under chains.<name>.alerts)
 # is enabled. Leave `enabled: no` to disable.
+# The globals stay off in this example; every chain block below shows the FULL
+# per-chain set (enabled flag + blank credential overrides), so to start
+# delivering flip the global to yes and fill in real credentials.
+# Pushover note: only critical, unresolved notifications are delivered (no
+# resolves, no warnings) — that is by design, not a missing setting.
 
 # Pagerduty (https://pagerduty.com). Requires an Events API v1/v2 API key.
 pagerduty:
@@ -172,18 +177,33 @@ chains:
       percentage_priority: warning
       alert_if_inactive: yes
       alert_if_no_servers: yes
-      # Blank sink credentials fall back to the global values; `enabled` must be
-      # yes both here and globally.
+      # Full per-chain sink set. `enabled: yes` here is necessary but not
+      # sufficient: the matching global sink must also be enabled. Blank
+      # creds/webhooks fall back to the global values, so `enabled` is the only
+      # field you MUST repeat per chain.
+      pagerduty:
+        enabled: no
+        api_key: ""
+        default_severity: ""
       discord:
         enabled: yes
         webhook: ""
+        mentions: []
       telegram:
         enabled: yes
         api_key: ""
         channel: ""
+        mentions: []
+      slack:
+        enabled: no
+        webhook: ""
+        mentions: []
       pushover:
         enabled: yes
-        priority: 2
+        token: ""
+        user_key: ""
+        priority: 2               # emergency; needs retry>=30 and expire>0
+        sound: ""
         retry: 30
         expire: 3600
     nodes:
@@ -194,6 +214,56 @@ chains:
         alert_if_down: yes
       - url: https://gnoland-mainnet-rpc.itrocket.net:443
         alert_if_down: yes
+
+  # ----- Gnoland testnet (onyx-1) — same provider, only chain_id/network/nodes
+  # ----- change. Testnet keeps Pushover disabled to show the on/off switch.
+  "Gno-Testnet":
+    chain_id: onyx-1
+    network: testnet
+    type: gnoland
+    valoper_address: g1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # OPERATOR addr (gnoweb)
+    gno_valopers_realm: "gno.land/r/gnops/valopers"
+    alerts:
+      stalled_enabled: yes
+      stalled_minutes: 5
+      consecutive_enabled: yes      # primary gno alert
+      consecutive_missed: 10
+      consecutive_priority: critical
+      percentage_enabled: no        # local signing-health window, noisy on testnet
+      percentage_missed: 10
+      percentage_priority: warning
+      alert_if_inactive: yes
+      alert_if_no_servers: yes
+      pagerduty:
+        enabled: no
+        api_key: ""
+        default_severity: ""
+      discord:
+        enabled: yes
+        webhook: ""
+        mentions: []
+      telegram:
+        enabled: yes
+        api_key: ""
+        channel: ""
+        mentions: []
+      slack:
+        enabled: no
+        webhook: ""
+        mentions: []
+      pushover:
+        enabled: no
+        token: ""
+        user_key: ""
+        priority: 1
+        sound: ""
+        retry: 30
+        expire: 3600
+    nodes:
+      - url: https://rpc.onyx.testnets.gno.land:443
+        alert_if_down: yes
+      - url: https://gnoland-testnet-rpc.itrocket.net:443
+        alert_if_down: no
 
   # ----- Espresso (HotShot) example -----
   # `type: espresso` selects the HotShot/Espresso provider. Espresso has no
@@ -238,13 +308,34 @@ chains:
       percentage_priority: warning
       alert_if_inactive: yes
       alert_if_no_servers: yes
+      # Full per-chain sink set. Pushover only delivers *critical, unresolved*
+      # notifications (resolves and warnings stay on Discord/Telegram); with
+      # consecutive_missed: 1 every missed leader duty is such a critical fire.
+      pagerduty:
+        enabled: no
+        api_key: ""
+        default_severity: ""
       discord:
         enabled: yes
         webhook: ""
+        mentions: []
       telegram:
         enabled: yes
         api_key: ""
         channel: ""
+        mentions: []
+      slack:
+        enabled: no
+        webhook: ""
+        mentions: []
+      pushover:
+        enabled: yes
+        token: ""
+        user_key: ""
+        priority: 2               # emergency; needs retry>=30 and expire>0
+        sound: ""
+        retry: 30
+        expire: 3600
     nodes:
       - url: https://query.main.net.espresso.network
         alert_if_down: yes
@@ -278,13 +369,34 @@ chains:
       percentage_priority: warning
       alert_if_inactive: yes
       alert_if_no_servers: yes
+      # Full sink set; testnet keeps Pushover off here to show the on/off
+      # switch — flip it to yes (and enable it globally) if you want mobile
+      # emergencies on Decaf too.
+      pagerduty:
+        enabled: no
+        api_key: ""
+        default_severity: ""
       discord:
         enabled: yes
         webhook: ""
+        mentions: []
       telegram:
         enabled: yes
         api_key: ""
         channel: ""
+        mentions: []
+      slack:
+        enabled: no
+        webhook: ""
+        mentions: []
+      pushover:
+        enabled: no
+        token: ""
+        user_key: ""
+        priority: 1
+        sound: ""
+        retry: 30
+        expire: 3600
     nodes:
       - url: https://query.decaf.testnet.espresso.network
         alert_if_down: yes
