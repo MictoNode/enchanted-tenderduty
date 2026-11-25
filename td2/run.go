@@ -212,6 +212,7 @@ func snapshotStateOf(c *Config) ([]byte, error) {
 					CountersValid: v.espressoCountersValid,
 					AssignedTotal: v.espressoAssignedTotal, MissedTotal: v.espressoMissedTotal,
 					Epoch: v.espressoEpoch, EpochAssigned: v.espressoEpochAssigned, EpochMissed: v.espressoEpochMissed,
+					EpochSeenSlots: v.espressoEpochSeenSlots, EpochSeenMissed: v.espressoEpochSeenMissed,
 					LastBlockNum: v.lastBlockNum, LastBlockTime: v.lastBlockTime,
 				}
 				if v.espressoWin != nil {

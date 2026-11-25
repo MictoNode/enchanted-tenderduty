@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,6 +63,12 @@ var (
 	// uncompressed from the query service) is re-fetched; active-set membership
 	// only changes at epoch boundaries.
 	espressoStakeTableInterval = 2 * time.Minute
+	// espressoParticipationEveryTicks fetches the per-epoch proposal
+	// participation ratio every N poll ticks (2 minutes at 5s). The ratio is the
+	// chain-side truth for epoch misses: the node's process-lifetime counters
+	// cannot see a leader slot that expired while the node was down for an
+	// upgrade, and a restart wipes the timeout increment before the next scrape.
+	espressoParticipationEveryTicks = 24
 )
 
 // espressoHTTPClient is shared so connections are reused: a fresh client per
@@ -298,6 +305,75 @@ func espressoFetchStakeTable(base string) (*espressoStakeTable, error) {
 	return &st, nil
 }
 
+// espressoFetchParticipation reads the query service's per-validator proposal
+// participation for one epoch. The value is proposals/slots in lowest terms: a
+// miss makes it strictly below 1.0 even when the node's own process-lifetime
+// counters reset (upgrade) and never observed the expired slot.
+func espressoFetchParticipation(base string, epoch int64) (map[string]float64, error) {
+	base = strings.TrimRight(base, "/")
+	code, body, err := espressoRawGET(fmt.Sprintf("%s/v1/node/participation/proposal/%d", base, epoch))
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("http %d from %s", code, base)
+	}
+	var m map[string]float64
+	if err = json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	if len(m) == 0 {
+		return nil, errors.New("empty participation response")
+	}
+	return m, nil
+}
+
+// espressoRatioFraction reconstructs the exact proposals/slots fraction behind
+// a participation ratio. The query service reports proposals/slots as a
+// float64, so the value is p/q for small integers; a continued-fraction
+// approximation recovers it without a leader schedule. The fraction is in
+// lowest terms (q=1 when nothing was missed), so the caller scales it by the
+// epoch's slot count (k*q).
+func espressoRatioFraction(r float64) (p, q int64, ok bool) {
+	if r == 0 {
+		return 0, 1, true
+	}
+	if r < 0 || r > 1 {
+		return 0, 0, false
+	}
+	if r == 1 {
+		return 1, 1, true
+	}
+	const maxDen = int64(1_000_000)
+	p0, q0 := int64(0), int64(1)
+	p1, q1 := int64(1), int64(0)
+	x := r
+	for i := 0; i < 64; i++ {
+		a := int64(x)
+		p2 := a*p1 + p0
+		q2 := a*q1 + q0
+		if q2 > maxDen || q2 <= 0 {
+			break
+		}
+		p0, q0 = p1, q1
+		p1, q1 = p2, q2
+		frac := x - float64(a)
+		if frac < 1e-12 {
+			break
+		}
+		x = 1 / frac
+	}
+	if q1 <= 0 {
+		return 0, 0, false
+	}
+	// The reported value is a float64 rounding of p/q; anything that does not
+	// reconstruct within float noise is not a ratio we can trust.
+	if math.Abs(r-float64(p1)/float64(q1)) > 1e-9 {
+		return 0, 0, false
+	}
+	return p1, q1, true
+}
+
 // espressoStakeTableHasKey reports whether the BLS key is in the active set.
 func espressoStakeTableHasKey(st *espressoStakeTable, key string) bool {
 	if st == nil || key == "" {
@@ -446,6 +522,8 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 			cc.espressoEpoch = st.Epoch
 			cc.espressoEpochAssigned = 0
 			cc.espressoEpochMissed = 0
+			cc.espressoEpochSeenSlots = 0
+			cc.espressoEpochSeenMissed = 0
 		}
 	} else if lastErr != nil && first {
 		l(fmt.Sprintf("⚠️ %s could not read the active stake table: %s", cc.ChainId, lastErr))

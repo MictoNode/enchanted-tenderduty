@@ -223,6 +223,10 @@ chains:
                                         # percentage_missed (real counts)
     espresso_vote_lag_views: 100        # current_view - last_voted_view before a
                                         # "not voting" warning (~45s)
+    # Every 2 minutes the provider also reads the query service's per-epoch
+    # participation ratio and credits misses the node counters could not see
+    # (a leader slot that expired while the node was down for an upgrade) into
+    # the epoch tally + duty window — log line starts with ⚖️.
     alerts:
       stalled_enabled: yes
       stalled_minutes: 3

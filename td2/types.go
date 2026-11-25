@@ -107,6 +107,11 @@ type espressoSavedStats struct {
 	Epoch         int64 `json:"epoch,omitempty"`
 	EpochAssigned int64 `json:"epoch_assigned,omitempty"`
 	EpochMissed   int64 `json:"epoch_missed,omitempty"`
+	// EpochSeen* is the local counter-only tally (what the chain cross-check
+	// subtracts before crediting invisible misses). Persisted so a restart does
+	// not re-credit duties the restored duty window already contains.
+	EpochSeenSlots  int64 `json:"epoch_seen_slots,omitempty"`
+	EpochSeenMissed int64 `json:"epoch_seen_missed,omitempty"`
 
 	LastBlockNum  int64     `json:"last_block_num,omitempty"`
 	LastBlockTime time.Time `json:"last_block_time,omitempty"`
@@ -156,21 +161,23 @@ type ChainConfig struct {
 	activeAlerts      int
 
 	// espresso provider runtime state (all guarded by stateMux).
-	espressoNode           *NodeConfig // the validator's own Status API, health-checked separately from the query nodes
-	espressoWin            *gnoWindow  // sliding leader-duty window (dashboard uptime %, percentage alarm)
-	espressoKey            string      // resolved BLS staking public key
-	espressoEpoch          int64       // current epoch reported by the stake table
-	espressoEpochAssigned  int64       // leader duties assigned in this epoch (from counter deltas)
-	espressoEpochMissed    int64       // leader duties missed in this epoch
-	espressoCountersValid  bool        // false until the first counter sample seeds the baseline
-	espressoAssignedTotal  int64       // last observed consensus_view_duration_as_leader_count
-	espressoMissedTotal    int64       // last observed consensus_number_of_timeouts_as_leader
-	espressoVoteLag        int64       // current_view - last_voted_view at the last health tick
-	espressoMetricsValid   bool        // a served metrics snapshot was parsed (vote lag is meaningful even with zero duties)
-	espressoKeyMismatch    bool        // espresso_node_url answers with a BLS key different from espresso_staking_key (foreign node)
-	espressoBondMissStreak int         // consecutive definitive not-in-active-set stake table answers
-	espressoMoniker        string      // node identity label, shared from the poller to avoid refetching metrics
-	espressoStakeTableAt   time.Time   // last successful stake table fetch (rate-limits the 45KB payload)
+	espressoNode            *NodeConfig // the validator's own Status API, health-checked separately from the query nodes
+	espressoWin             *gnoWindow  // sliding leader-duty window (dashboard uptime %, percentage alarm)
+	espressoKey             string      // resolved BLS staking public key
+	espressoEpoch           int64       // current epoch reported by the stake table
+	espressoEpochAssigned   int64       // leader duties assigned in this epoch (counter deltas, or the chain cross-check once it answers)
+	espressoEpochMissed     int64       // leader duties missed in this epoch
+	espressoEpochSeenSlots  int64       // local counter-only epoch tally (chain credit compares against it, never double counts)
+	espressoEpochSeenMissed int64
+	espressoCountersValid   bool      // false until the first counter sample seeds the baseline
+	espressoAssignedTotal   int64     // last observed consensus_view_duration_as_leader_count
+	espressoMissedTotal     int64     // last observed consensus_number_of_timeouts_as_leader
+	espressoVoteLag         int64     // current_view - last_voted_view at the last health tick
+	espressoMetricsValid    bool      // a served metrics snapshot was parsed (vote lag is meaningful even with zero duties)
+	espressoKeyMismatch     bool      // espresso_node_url answers with a BLS key different from espresso_staking_key (foreign node)
+	espressoBondMissStreak  int       // consecutive definitive not-in-active-set stake table answers
+	espressoMoniker         string    // node identity label, shared from the poller to avoid refetching metrics
+	espressoStakeTableAt    time.Time // last successful stake table fetch (rate-limits the 45KB payload)
 
 	// espressoNodeDownSince/espressoNodeWasDown carry a persisted validator-node
 	// failure from loadConfig (where espressoNode does not exist yet) into
@@ -854,6 +861,17 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		cc.espressoEpoch = v.Epoch
 		cc.espressoEpochAssigned = v.EpochAssigned
 		cc.espressoEpochMissed = v.EpochMissed
+		cc.espressoEpochSeenSlots = v.EpochSeenSlots
+		cc.espressoEpochSeenMissed = v.EpochSeenMissed
+		// State files written before the chain cross-check existed carry only the
+		// (then local-only) epoch tally; seed from it so the first poll does not
+		// re-credit duties the restored duty window already contains.
+		if cc.espressoEpochSeenSlots == 0 {
+			cc.espressoEpochSeenSlots = v.EpochAssigned
+		}
+		if cc.espressoEpochSeenMissed == 0 {
+			cc.espressoEpochSeenMissed = v.EpochMissed
+		}
 		cc.lastBlockNum = v.LastBlockNum
 		if cc.EspressoDutyWindow <= 0 {
 			cc.EspressoDutyWindow = espressoDefaultDutyWindow

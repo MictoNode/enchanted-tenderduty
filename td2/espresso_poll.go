@@ -48,6 +48,10 @@ func (cc *ChainConfig) EspressoPollRun() {
 	if windowSize <= 0 {
 		windowSize = espressoDefaultDutyWindow
 	}
+	partEvery := espressoParticipationEveryTicks
+	if partEvery < 1 {
+		partEvery = 1
+	}
 	cc.stateMux.Lock()
 	if cc.espressoWin == nil {
 		cc.espressoWin = newGnoWindow(windowSize)
@@ -123,6 +127,32 @@ func (cc *ChainConfig) EspressoPollRun() {
 					cc.stateMux.Lock()
 					cc.espressoMoniker = st.Moniker
 					cc.stateMux.Unlock()
+				}
+			}
+
+			// Chain-side epoch truth: the query service's participation ratio for
+			// this epoch (poll-all like the head; one good answer is enough).
+			var part map[string]float64
+			var partEpoch int64
+			if duties && (tickN-1)%partEvery == 0 {
+				cc.stateMux.RLock()
+				partEpoch = cc.espressoEpoch
+				cc.stateMux.RUnlock()
+				if partEpoch > 0 {
+					for _, n := range cc.Nodes {
+						cc.stateMux.RLock()
+						down, url := n.down, n.Url
+						cc.stateMux.RUnlock()
+						if down {
+							continue
+						}
+						m, err := espressoFetchParticipation(url, partEpoch)
+						if err != nil || len(m) == 0 {
+							continue
+						}
+						part = m
+						break
+					}
 				}
 			}
 
@@ -239,6 +269,10 @@ func (cc *ChainConfig) EspressoPollRun() {
 						}
 						cc.valInfo.Missed = int64(cc.espressoWin.Missed())
 						cc.valInfo.Window = int64(cc.espressoWin.Window())
+						// Local counter-only tally: the chain cross-check subtracts
+						// this before crediting misses the counters could not see.
+						cc.espressoEpochSeenSlots += dAssigned
+						cc.espressoEpochSeenMissed += dMissed
 
 						// Grid cells for missed duties. Decided blocks are added
 						// separately below, so the grid keeps flowing at block rate
@@ -265,6 +299,25 @@ func (cc *ChainConfig) EspressoPollRun() {
 							logMsgs = append(logMsgs, fmt.Sprintf("✅ %s proposed leader duty on %s (epoch %d, proposals %d/%d)",
 								cc.valInfo.Moniker, cc.ChainId, cc.espressoEpoch, proposals, cc.espressoEpochAssigned))
 						}
+					}
+				}
+			}
+
+			// Chain-side cross-check: credit epoch misses the node counters could
+			// not observe — a leader slot that expired while the node was down for
+			// an upgrade never increments its own counter, and a restart wipes the
+			// increment before the next scrape (the re-baseline path above).
+			if part != nil && partEpoch == cc.espressoEpoch {
+				ccKey := cc.espressoKey
+				if ccKey == "" {
+					ccKey = cc.EspressoStakingKey
+				}
+				if r, ok := part[ccKey]; ok {
+					if msg, credited := cc.applyEspressoParticipation(r); credited {
+						if msg != "" {
+							logMsgs = append(logMsgs, msg)
+						}
+						events++
 					}
 				}
 			}
@@ -375,4 +428,75 @@ func (cc *ChainConfig) EspressoPollRun() {
 			}
 		}
 	}
+}
+
+// applyEspressoParticipation credits the chain-side proposal participation
+// ratio for the current epoch into the dashboard tally and the sliding duty
+// window. The query service reports proposals/slots in lowest terms; scaling q
+// by k (the nearest multiple of the local assignment tally) recovers the real
+// slot and miss counts without a leader schedule. Only events the node counters
+// could not see are credited, so re-polling an epoch never double counts.
+// Caller must hold stateMux.
+func (cc *ChainConfig) applyEspressoParticipation(r float64) (msg string, credited bool) {
+	p, q, ok := espressoRatioFraction(r)
+	if !ok || q <= 0 || cc.valInfo == nil || cc.espressoWin == nil {
+		return "", false
+	}
+	// A perfect ratio with no locally observed slot only says "nothing missed
+	// yet"; adopting it would fabricate a 1-slot epoch at epoch start.
+	if p == q && cc.espressoEpochSeenSlots == 0 {
+		return "", false
+	}
+	k := int64(1)
+	if base := cc.espressoEpochAssigned; base >= q {
+		k = (base + q/2) / q
+		if k < 1 {
+			k = 1
+		}
+	}
+	slots := k * q
+	missed := k * (q - p)
+	if slots < missed {
+		return "", false
+	}
+	// Adopt the chain tally even when it only confirms the local one: this
+	// repairs the assigned count after a mid-epoch counter reset (restart).
+	seenSlots, seenMissed := cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed
+	cc.espressoEpochAssigned = slots
+	cc.espressoEpochMissed = missed
+	if seenSlots < slots {
+		seenSlots = slots
+	}
+	if seenMissed < missed {
+		seenMissed = missed
+	}
+	dSlots := slots - cc.espressoEpochSeenSlots
+	dMissed := missed - cc.espressoEpochSeenMissed
+	cc.espressoEpochSeenSlots = seenSlots
+	cc.espressoEpochSeenMissed = seenMissed
+	if dSlots < 0 {
+		dSlots = 0
+	}
+	if dMissed < 0 {
+		dMissed = 0
+	}
+	if dSlots < dMissed {
+		dSlots = dMissed
+	}
+	for i := int64(0); i < dMissed; i++ {
+		cc.espressoWin.Push(true)
+	}
+	for i := int64(0); i < dSlots-dMissed; i++ {
+		cc.espressoWin.Push(false)
+	}
+	if dSlots == 0 && dMissed == 0 {
+		return "", false
+	}
+	cc.valInfo.Missed = int64(cc.espressoWin.Missed())
+	cc.valInfo.Window = int64(cc.espressoWin.Window())
+	if dMissed == 0 {
+		return "", true
+	}
+	return fmt.Sprintf("⚖️ %-12s chain participation %d/%d (epoch %d): %d missed duty(s) invisible to the node counters; credited",
+		cc.ChainId, p*k, slots, cc.espressoEpoch, dMissed), true
 }

@@ -54,6 +54,11 @@ type espressoMock struct {
 	current  int64
 	voted    int64
 	height   int64
+	epoch    int64
+	// participation is served as the per-validator proposal ratio for partEpoch;
+	// nil makes the endpoint 404 (a query service without participation data).
+	participation map[string]float64
+	partEpoch     int64
 }
 
 func (m *espressoMock) set(assigned, missed, height int64) {
@@ -62,10 +67,31 @@ func (m *espressoMock) set(assigned, missed, height int64) {
 	m.mu.Unlock()
 }
 
+func (m *espressoMock) setEpoch(epoch int64) {
+	m.mu.Lock()
+	m.epoch = epoch
+	m.mu.Unlock()
+}
+
+func (m *espressoMock) setParticipation(epoch int64, ratio float64) {
+	m.mu.Lock()
+	m.participation = map[string]float64{espressoTestKey: ratio}
+	m.partEpoch = epoch
+	m.mu.Unlock()
+}
+
 func (m *espressoMock) serve(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	assigned, missed, current, voted, height := m.assigned, m.missed, m.current, m.voted, m.height
+	epoch, part, partEpoch := m.epoch, m.participation, m.partEpoch
 	m.mu.Unlock()
+	if epoch <= 0 {
+		epoch = 845
+	}
+	if part != nil && r.URL.Path == fmt.Sprintf("/v1/node/participation/proposal/%d", partEpoch) {
+		_ = json.NewEncoder(w).Encode(part)
+		return
+	}
 	switch r.URL.Path {
 	case "/v1/status/metrics":
 		_, _ = w.Write([]byte(espressoMetricsFixture(assigned, missed, current, voted, espressoTestKey, "MictoNode")))
@@ -77,7 +103,7 @@ func (m *espressoMock) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"eth_account":%q,"consensus_key":%q,"state_ver_key":"SCHNORR_VER_KEY~x","x25519_key":"X25519_PK~x","p2p_addr":"1.2.3.4:9977"}`,
 			espressoTestEth, espressoTestKey)
 	case "/v1/node/stake-table/current":
-		_, _ = fmt.Fprintf(w, `{"epoch":845,"stake_table":[{"stake_table_entry":{"stake_key":%q,"stake_amount":"0x42"}}]}`, espressoTestKey)
+		_, _ = fmt.Fprintf(w, `{"epoch":%d,"stake_table":[{"stake_table_entry":{"stake_key":%q,"stake_amount":"0x42"}}]}`, epoch, espressoTestKey)
 	default:
 		http.NotFound(w, r)
 	}
@@ -890,5 +916,182 @@ func TestEspressoStakeTableDecafShape(t *testing.T) {
 	}
 	if espressoStakeTableHasKey(st, espressoTestKey) {
 		t.Fatal("membership matched an unrelated BLS key")
+	}
+}
+
+// TestEspressoRatioFraction: the query service reports proposals/slots as a
+// float64; the recovered fraction is in lowest terms, so the caller scales it
+// by the local assignment tally to get real slot/miss counts.
+func TestEspressoRatioFraction(t *testing.T) {
+	cases := []struct {
+		ratio float64
+		p, q  int64
+		ok    bool
+	}{
+		{1, 1, 1, true},
+		{0, 0, 1, true},
+		{53.0 / 54.0, 53, 54, true},
+		{21.0 / 22.0, 21, 22, true},
+		{0.9782608695652174, 45, 46, true},
+		{7.0 / 11.0, 7, 11, true},
+		{-0.1, 0, 0, false},
+	}
+	for _, c := range cases {
+		p, q, ok := espressoRatioFraction(c.ratio)
+		if ok != c.ok || (ok && (p != c.p || q != c.q)) {
+			t.Fatalf("ratio %v: got %d/%d ok=%v, want %d/%d ok=%v", c.ratio, p, q, ok, c.p, c.q, c.ok)
+		}
+	}
+}
+
+// TestEspressoPollCreditsChainMissesInvisibleToCounters: an upgrade restart
+// resets the node's process-lifetime counters, so a leader slot that expired
+// while the node was down never increments its own counter. The query service's
+// epoch participation ratio is the chain truth and must repair the dashboard
+// tally and the duty window instead of reporting 0 missed / 100%.
+func TestEspressoPollCreditsChainMissesInvisibleToCounters(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+	origEvery := espressoParticipationEveryTicks
+	espressoParticipationEveryTicks = 1
+	t.Cleanup(func() { espressoParticipationEveryTicks = origEvery })
+
+	m := &espressoMock{current: 1000, voted: 999, height: 900}
+	m.set(48, 0, 900) // counters since the restart: 48 duties, none missed
+	m.setParticipation(845, 53.0/54.0)
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.espressoEpoch = 845
+	cc.lastBlockNum = 900
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		cc.stateMux.RLock()
+		got := cc.espressoEpochMissed == 1 && cc.espressoEpochAssigned == 54
+		cc.stateMux.RUnlock()
+		if got {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("timed out waiting for the chain cross-check to credit the invisible miss")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
+	if cc.espressoEpochAssigned != 54 || cc.espressoEpochMissed != 1 {
+		t.Fatalf("epoch tally: assigned=%d missed=%d, want 54/1", cc.espressoEpochAssigned, cc.espressoEpochMissed)
+	}
+	if cc.valInfo.Missed != 1 || cc.valInfo.Window != 54 {
+		t.Fatalf("duty window: missed=%d window=%d, want 1/54", cc.valInfo.Missed, cc.valInfo.Window)
+	}
+	if cc.espressoEpochSeenSlots != 54 || cc.espressoEpochSeenMissed != 1 {
+		t.Fatalf("seen tally: slots=%d missed=%d, want 54/1 (re-poll must not double count)",
+			cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed)
+	}
+}
+
+// TestEspressoPollParticipationFailureKeepsLocalTally: a query service without
+// participation data must leave the counter-based behaviour untouched.
+func TestEspressoPollParticipationFailureKeepsLocalTally(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+	origEvery := espressoParticipationEveryTicks
+	espressoParticipationEveryTicks = 1
+	t.Cleanup(func() { espressoParticipationEveryTicks = origEvery })
+
+	m := &espressoMock{current: 1000, voted: 999, height: 800}
+	m.set(10, 0, 800)
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.espressoEpoch = 845
+	cc.lastBlockNum = 800
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(4 * time.Second)
+		for {
+			cc.stateMux.RLock()
+			ok := cond()
+			cc.stateMux.RUnlock()
+			if ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				cancel()
+				<-done
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	waitFor("baseline sample", func() bool { return cc.espressoCountersValid })
+	m.set(12, 1, 801)
+	waitFor("local miss", func() bool { return cc.espressoEpochMissed == 1 })
+
+	cancel()
+	<-done
+
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
+	if cc.espressoEpochAssigned != 2 || cc.valInfo.Window != 2 {
+		t.Fatalf("local tally changed without participation data: assigned=%d window=%d",
+			cc.espressoEpochAssigned, cc.valInfo.Window)
+	}
+	if cc.valInfo.Missed != 1 {
+		t.Fatalf("window missed: %d, want 1", cc.valInfo.Missed)
+	}
+}
+
+// TestEspressoEpochChangeClearsChainCrossCheckTally: the seen/credited tallies
+// are per-epoch; carrying them into a new epoch would suppress the credit (the
+// chain denominator restarts) or credit the previous epoch's misses.
+func TestEspressoEpochChangeClearsChainCrossCheckTally(t *testing.T) {
+	allowEveryStakeTableFetch(t)
+
+	m := &espressoMock{current: 10, voted: 9, height: 1}
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.espressoWin = newGnoWindow(10)
+	cc.espressoEpoch = 845
+	cc.espressoEpochAssigned = 54
+	cc.espressoEpochMissed = 1
+	cc.espressoEpochSeenSlots = 54
+	cc.espressoEpochSeenMissed = 1
+	m.setEpoch(846)
+
+	if err := cc.EspressoGetValInfo(false); err != nil {
+		t.Fatalf("GetValInfo: %v", err)
+	}
+	if cc.espressoEpoch != 846 {
+		t.Fatalf("epoch: %d, want 846", cc.espressoEpoch)
+	}
+	if cc.espressoEpochAssigned != 0 || cc.espressoEpochMissed != 0 ||
+		cc.espressoEpochSeenSlots != 0 || cc.espressoEpochSeenMissed != 0 {
+		t.Fatalf("epoch tallies not reset: assigned=%d missed=%d seen=%d/%d",
+			cc.espressoEpochAssigned, cc.espressoEpochMissed,
+			cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed)
 	}
 }
