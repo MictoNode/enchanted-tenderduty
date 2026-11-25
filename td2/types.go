@@ -164,6 +164,7 @@ type ChainConfig struct {
 	espressoNode            *NodeConfig // the validator's own Status API, health-checked separately from the query nodes
 	espressoWin             *gnoWindow  // sliding leader-duty window (dashboard uptime %, percentage alarm)
 	espressoKey             string      // resolved BLS staking public key
+	espressoAccount         string      // node's L1 (0x) account — the staking-API lookup key
 	espressoEpoch           int64       // current epoch reported by the stake table
 	espressoEpochAssigned   int64       // leader duties assigned in this epoch (counter deltas, or the chain cross-check once it answers)
 	espressoEpochMissed     int64       // leader duties missed in this epoch
@@ -231,17 +232,26 @@ type ChainConfig struct {
 	GnoSignedBlocksWindow int `yaml:"gno_signed_blocks_window"`
 
 	// EspressoNodeURL is the base URL of the validator's own Espresso Status API
-	// (ESPRESSO_NODE_API_PORT). Only that node counts the leader slots assigned
-	// to it (consensus_view_duration_as_leader_count) and the ones it failed to
-	// propose (consensus_number_of_timeouts_as_leader); the public query service
-	// exposes per-epoch rates only, which are too coarse to alert on. Without
-	// this URL the chain is still watched for stalls and node lag, but leader
-	// duties are not tracked.
+	// (ESPRESSO_NODE_API_PORT). Needed to resolve the validator identity: the BLS
+	// key and the L1 (0x) account that keys the staking API's chain-derived
+	// counts. The node's own leader counters also paint the per-block grid and
+	// back up the dashboard while the staking API is unreachable; without this
+	// URL the chain is still watched for stalls and node lag, but leader duties
+	// are not tracked.
 	EspressoNodeURL string `yaml:"espresso_node_url"`
 	// EspressoStakingKey is the validator BLS staking public key
 	// (BLS_VER_KEY~...). Optional: discovered from the node's /v1/status/keys
 	// (falling back to the consensus_node metric) when empty.
 	EspressoStakingKey string `yaml:"espresso_staking_key"`
+	// EspressoStakingAPI is the chain-derived leader-duty source (the Espresso
+	// staking API that stake.espresso.network uses): nodes/active reports exact
+	// per-epoch proposals/slots keyed by the validator's L1 account, so a slot
+	// missed while the node was down — or one whose proposal never reached
+	// quorum — is still counted. Empty = built-in default for `network`
+	// (mainnet → staking-api.main.net, testnet → staking-api.decaf.testnet).
+	// Unreachable → falls back to the participation-rate cross-check plus the
+	// node's own counters.
+	EspressoStakingAPI string `yaml:"espresso_staking_api"`
 	// EspressoDutyWindow is how many recent leader duties the dashboard uptime %
 	// and the percentage_missed alert are computed over. Default 1000.
 	EspressoDutyWindow int `yaml:"espresso_duty_window"`
@@ -501,6 +511,11 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			}
 			if v.EspressoVoteLagViews <= 0 {
 				v.EspressoVoteLagViews = espressoDefaultVoteLag
+			}
+			if v.EspressoStakingAPI == "" {
+				v.EspressoStakingAPI = espressoDefaultStakingAPI(v.Network)
+			} else {
+				v.EspressoStakingAPI = strings.TrimRight(v.EspressoStakingAPI, "/")
 			}
 			if v.espressoWin == nil {
 				v.espressoWin = newGnoWindow(v.EspressoDutyWindow)

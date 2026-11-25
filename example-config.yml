@@ -289,6 +289,11 @@ chains:
     type: espresso
     espresso_node_url: https://espresso-node.example.com:28181
     # espresso_staking_key: BLS_VER_KEY~...   # blank = auto-discover from the node
+    # Chain-derived leader-slot/missed counts (the source stake.espresso.network
+    # uses). Blank = default for `network`:
+    #   mainnet → https://staking-api.main.net.espresso.network/v0/staking
+    #   testnet → https://staking-api.decaf.testnet.espresso.network/v0/staking
+    espresso_staking_api: https://staking-api.main.net.espresso.network/v0/staking
     espresso_duty_window: 1000          # recent leader duties for uptime % +
                                         # percentage_missed (real counts)
     espresso_vote_lag_views: 100        # current_view - last_voted_view before a
@@ -356,6 +361,7 @@ chains:
     type: espresso
     espresso_node_url: https://espresso-node.example.com:28181
     # espresso_staking_key: BLS_VER_KEY~...   # blank = auto-discover from the node
+    espresso_staking_api: https://staking-api.decaf.testnet.espresso.network/v0/staking
     espresso_duty_window: 1000
     espresso_vote_lag_views: 100
     alerts:

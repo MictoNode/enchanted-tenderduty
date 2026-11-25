@@ -52,6 +52,11 @@ const (
 	// must contain before the percentage alarm is evaluated: one miss in a
 	// 2-duty window is "50%", a false critical that consecutive_missed covers.
 	espressoPercentageMinWindow = 100
+	// Built-in Espresso staking API (chain-derived per-validator counts, the
+	// source stake.espresso.network uses). A chain's `espresso_staking_api`
+	// overrides it; unreachable → participation-rate cross-check + node counters.
+	espressoStakingAPIMainnet = "https://staking-api.main.net.espresso.network/v0/staking"
+	espressoStakingAPITestnet = "https://staking-api.decaf.testnet.espresso.network/v0/staking"
 )
 
 var (
@@ -70,6 +75,15 @@ var (
 	// upgrade, and a restart wipes the timeout increment before the next scrape.
 	espressoParticipationEveryTicks = 24
 )
+
+// espressoDefaultStakingAPI picks the built-in staking API for a network.
+// Decaf chains set `network: testnet`.
+func espressoDefaultStakingAPI(network string) string {
+	if strings.EqualFold(network, "testnet") {
+		return espressoStakingAPITestnet
+	}
+	return espressoStakingAPIMainnet
+}
 
 // espressoHTTPClient is shared so connections are reused: a fresh client per
 // request would pay a TCP+TLS handshake for every 5s poll of every endpoint.
@@ -109,6 +123,51 @@ type espressoKeys struct {
 	StateVerKey  string `json:"state_ver_key"`
 	X25519Key    string `json:"x25519_key"`
 	P2PAddr      string `json:"p2p_addr"`
+}
+
+// espressoActiveNode is one validator's chain-derived counters for the current
+// epoch: slots assigned, proposals landed (missed = slots - proposals).
+type espressoActiveNode struct {
+	Address       string `json:"address"`
+	Votes         int64  `json:"votes"`
+	EligibleVotes int64  `json:"eligible_votes"`
+	Proposals     int64  `json:"proposals"`
+	Slots         int64  `json:"slots"`
+}
+
+// espressoNodesActive is the staking API's nodes/active response.
+type espressoNodesActive struct {
+	EspressoBlock struct {
+		Epoch int64 `json:"epoch"`
+	} `json:"espresso_block"`
+	Nodes []espressoActiveNode `json:"nodes"`
+}
+
+// espressoFetchNodesActive reads the chain-derived per-validator counters for
+// the current epoch (the source stake.espresso.network uses). Unlike the node's
+// own process-lifetime counters this sees every assigned slot, including one
+// that expired while the node was down and one whose proposal never reached
+// quorum.
+func espressoFetchNodesActive(base string) (*espressoNodesActive, error) {
+	base = strings.TrimRight(base, "/")
+	code, body, err := espressoRawGET(base + "/nodes/active")
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("http %d from %s", code, base)
+	}
+	var na espressoNodesActive
+	if err = json.Unmarshal(body, &na); err != nil {
+		return nil, err
+	}
+	if na.EspressoBlock.Epoch <= 0 {
+		return nil, errors.New("empty nodes/active response")
+	}
+	if len(na.Nodes) == 0 {
+		return nil, errors.New("nodes/active returned no validators")
+	}
+	return &na, nil
 }
 
 // espressoStakeTable is the /v1/node/stake-table/current response. Only the
@@ -411,9 +470,11 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 	// operator registered); the metrics label is the fallback for builds that
 	// do not serve the keys endpoint.
 	var nodeKey, nodeMoniker, nodeVersion string
+	var nodeAccount string
 	if cc.EspressoNodeURL != "" {
 		if keys, err := espressoFetchKeys(cc.EspressoNodeURL); err == nil {
 			nodeKey = keys.ConsensusKey
+			nodeAccount = keys.EthAccount
 		} else if first {
 			l(fmt.Sprintf("⚠️ %s could not read espresso node keys from %s: %s", cc.ChainId, cc.EspressoNodeURL, err))
 		}
@@ -548,6 +609,9 @@ func (cc *ChainConfig) EspressoGetValInfo(first bool) error {
 	}
 
 	cc.espressoKey = key
+	if nodeAccount != "" {
+		cc.espressoAccount = nodeAccount
+	}
 	cc.valInfo.Moniker = moniker
 	cc.valInfo.Valcons = key
 	cc.valInfo.Bonded = bonded

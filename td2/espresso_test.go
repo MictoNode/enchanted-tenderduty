@@ -55,6 +55,11 @@ type espressoMock struct {
 	voted    int64
 	height   int64
 	epoch    int64
+	// activeEpoch/activeSlots/activeProps are served by the staking API's
+	// nodes/active endpoint (chain-derived counts for the test validator).
+	activeEpoch int64
+	activeSlots int64
+	activeProps int64
 	// participation is served as the per-validator proposal ratio for partEpoch;
 	// nil makes the endpoint 404 (a query service without participation data).
 	participation map[string]float64
@@ -80,13 +85,30 @@ func (m *espressoMock) setParticipation(epoch int64, ratio float64) {
 	m.mu.Unlock()
 }
 
+func (m *espressoMock) setActive(epoch, slots, proposals int64) {
+	m.mu.Lock()
+	m.activeEpoch, m.activeSlots, m.activeProps = epoch, slots, proposals
+	m.mu.Unlock()
+}
+
 func (m *espressoMock) serve(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	assigned, missed, current, voted, height := m.assigned, m.missed, m.current, m.voted, m.height
 	epoch, part, partEpoch := m.epoch, m.participation, m.partEpoch
+	activeEpoch, activeSlots, activeProps := m.activeEpoch, m.activeSlots, m.activeProps
 	m.mu.Unlock()
 	if epoch <= 0 {
 		epoch = 845
+	}
+	if activeEpoch > 0 && r.URL.Path == "/v0/staking/nodes/active" {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"espresso_block": map[string]any{"epoch": activeEpoch},
+			"nodes": []map[string]any{{
+				"address": espressoTestEth, "slots": activeSlots, "proposals": activeProps,
+				"votes": 1, "eligible_votes": 1,
+			}},
+		})
+		return
 	}
 	if part != nil && r.URL.Path == fmt.Sprintf("/v1/node/participation/proposal/%d", partEpoch) {
 		_ = json.NewEncoder(w).Encode(part)
@@ -431,6 +453,9 @@ func TestEspressoGetValInfoStakeTableAndKeyDiscovery(t *testing.T) {
 	}
 	if cc.valInfo.Moniker != "MictoNode" {
 		t.Fatalf("moniker: %q", cc.valInfo.Moniker)
+	}
+	if cc.espressoAccount != espressoTestEth {
+		t.Fatalf("L1 account: %q, want %q", cc.espressoAccount, espressoTestEth)
 	}
 	if !cc.valInfo.Bonded {
 		t.Fatal("validator in the stake table must be bonded")
@@ -1093,5 +1118,112 @@ func TestEspressoEpochChangeClearsChainCrossCheckTally(t *testing.T) {
 		t.Fatalf("epoch tallies not reset: assigned=%d missed=%d seen=%d/%d",
 			cc.espressoEpochAssigned, cc.espressoEpochMissed,
 			cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed)
+	}
+}
+
+// TestEspressoDefaultStakingAPI: `espresso_staking_api` empty falls back to the
+// built-in staking service for the configured network (Decaf = testnet).
+func TestEspressoDefaultStakingAPI(t *testing.T) {
+	cases := map[string]string{
+		"":        espressoStakingAPIMainnet,
+		"mainnet": espressoStakingAPIMainnet,
+		"testnet": espressoStakingAPITestnet,
+		"TESTNET": espressoStakingAPITestnet,
+		"Mainnet": espressoStakingAPIMainnet,
+	}
+	for network, want := range cases {
+		if got := espressoDefaultStakingAPI(network); got != want {
+			t.Fatalf("network %q: got %q, want %q", network, got, want)
+		}
+	}
+}
+
+// TestEspressoPollCreditsStakingAPICounts: the staking API's chain-derived
+// counters are the primary epoch truth. A slot the node's own process-lifetime
+// counter never saw (down for an upgrade, or its proposal never reached quorum)
+// must be credited into the epoch tally, the duty window and the consecutive
+// streak; a later proposal on chain resets the streak.
+func TestEspressoPollCreditsStakingAPICounts(t *testing.T) {
+	shortenEspressoPollTimers(t, 10*time.Millisecond, time.Minute)
+	origEvery := espressoParticipationEveryTicks
+	espressoParticipationEveryTicks = 1
+	t.Cleanup(func() { espressoParticipationEveryTicks = origEvery })
+
+	m := &espressoMock{current: 1000, voted: 999, height: 900}
+	m.set(48, 0, 900)        // node counters since the restart: 48 duties, none missed
+	m.setActive(845, 54, 53) // chain: 54 leader slots, 1 missed
+	srv := httptest.NewServer(http.HandlerFunc(m.serve))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCtx(t, ctx)
+
+	cc := newEspressoTestChain(srv.URL)
+	cc.EspressoStakingAPI = srv.URL + "/v0/staking"
+	cc.espressoAccount = espressoTestEth
+	cc.espressoEpoch = 845
+	cc.lastBlockNum = 900
+	done := make(chan struct{})
+	go func() { cc.EspressoPollRun(); close(done) }()
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(4 * time.Second)
+		for {
+			cc.stateMux.RLock()
+			ok := cond()
+			cc.stateMux.RUnlock()
+			if ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				cancel()
+				<-done
+				cc.stateMux.RLock()
+				a, mi, s, sm := cc.espressoEpochAssigned, cc.espressoEpochMissed, cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed
+				ep, ac := cc.espressoEpoch, cc.espressoAccount
+				cc.stateMux.RUnlock()
+				t.Fatalf("timed out waiting for %s (assigned=%d missed=%d seen=%d/%d epoch=%d account=%q api=%q)",
+					what, a, mi, s, sm, ep, ac, cc.EspressoStakingAPI)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	waitFor("chain baseline", func() bool {
+		return cc.espressoEpochAssigned == 54 && cc.espressoEpochMissed == 1 && cc.espressoEpochSeenSlots == 54
+	})
+	cc.stateMux.RLock()
+	if cc.statConsecutiveMiss != 0 {
+		cc.stateMux.RUnlock()
+		t.Fatal("first chain observation must be a silent baseline, not an alert")
+	}
+	cc.stateMux.RUnlock()
+
+	// A new missed slot after the baseline extends the streak (missing =+1 with
+	// no proposals in the same batch).
+	m.setActive(845, 55, 53)
+	waitFor("new chain miss", func() bool {
+		return cc.espressoEpochAssigned == 55 && cc.espressoEpochMissed == 2 && cc.statConsecutiveMiss == 1
+	})
+
+	// Proposals land again: streak resets (the chain miss total itself never
+	// decreases inside an epoch, so missed stays 2).
+	m.setActive(845, 57, 55)
+	waitFor("streak reset", func() bool {
+		return cc.espressoEpochAssigned == 57 && cc.espressoEpochMissed == 2 && cc.statConsecutiveMiss == 0
+	})
+
+	cancel()
+	<-done
+
+	cc.stateMux.RLock()
+	defer cc.stateMux.RUnlock()
+	if cc.espressoEpochSeenSlots != 57 || cc.espressoEpochSeenMissed != 2 {
+		t.Fatalf("seen tally: %d/%d, want 57/2", cc.espressoEpochSeenSlots, cc.espressoEpochSeenMissed)
+	}
+	if cc.valInfo.Missed != 2 || cc.valInfo.Window != 57 {
+		t.Fatalf("duty window: missed=%d window=%d, want 2/57", cc.valInfo.Missed, cc.valInfo.Window)
 	}
 }
